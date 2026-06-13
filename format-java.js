@@ -4,7 +4,7 @@
 /*
  * kiro-java-format
  *
- * Copyright (c) 2026 Yusuke Saito.
+ * Copyright (c) 2026 SAITO Yusuke, Mirai-souzou inc.
  * Licensed under the Apache License, Version 2.0.
  *
  * Formats Java files from the command line by driving the language server

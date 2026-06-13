@@ -157,7 +157,7 @@ keep it dependency-free.
 
 ## License
 
-Copyright (c) 2026 Yusuke Saito.
+Copyright (c) 2026 SAITO Yusuke, Mirai-souzou inc.
 
 Licensed under [Apache-2.0](LICENSE). The Oracle Java extension and its bundled `nbcode`
 are separate software with their own license; this project does not redistribute them —
