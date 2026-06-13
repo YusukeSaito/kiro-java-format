@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+# Wrapper that runs the kiro-java-format Node script.
+# Resolves its own location so it works regardless of where it is symlinked from.
+set -euo pipefail
+
+SOURCE="${BASH_SOURCE[0]}"
+while [ -h "$SOURCE" ]; do
+  DIR="$(cd -P "$(dirname "$SOURCE")" >/dev/null 2>&1 && pwd)"
+  SOURCE="$(readlink "$SOURCE")"
+  [[ $SOURCE != /* ]] && SOURCE="$DIR/$SOURCE"
+done
+DIR="$(cd -P "$(dirname "$SOURCE")" >/dev/null 2>&1 && pwd)"
+
+exec node "$DIR/../format-java.js" "$@"

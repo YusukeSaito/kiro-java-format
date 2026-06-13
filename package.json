@@ -1,0 +1,21 @@
+{
+  "name": "kiro-java-format",
+  "version": "1.0.0",
+  "description": "Format Java files from the CLI using the formatter bundled in the Oracle Java extension (oracle.oracle-java).",
+  "bin": {
+    "kiro-java-format": "bin/kiro-java-format"
+  },
+  "scripts": {
+    "install-cli": "bash install.sh"
+  },
+  "engines": {
+    "node": ">=16"
+  },
+  "license": "Apache-2.0",
+  "files": [
+    "format-java.js",
+    "bin/",
+    "steering/",
+    "install.sh"
+  ]
+}
