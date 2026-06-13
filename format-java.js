@@ -4,6 +4,9 @@
 /*
  * kiro-java-format
  *
+ * Copyright (c) 2026 Yusuke Saito.
+ * Licensed under the Apache License, Version 2.0.
+ *
  * Formats Java files from the command line by driving the language server
  * bundled inside the installed Oracle Java extension (oracle.oracle-java).
  *

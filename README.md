@@ -157,9 +157,11 @@ keep it dependency-free.
 
 ## License
 
-[Apache-2.0](LICENSE). The Oracle Java extension and its bundled `nbcode` are separate
-software with their own license; this project does not redistribute them — it only
-invokes a copy you have already installed.
+Copyright (c) 2026 Yusuke Saito.
+
+Licensed under [Apache-2.0](LICENSE). The Oracle Java extension and its bundled `nbcode`
+are separate software with their own license; this project does not redistribute them —
+it only invokes a copy you have already installed.
 
 ## Acknowledgements
 
