@@ -1,7 +1,7 @@
 {
   "name": "kiro-java-format",
-  "version": "1.0.0",
-  "description": "Format Java files from the CLI using the formatter bundled in the Oracle Java extension (oracle.oracle-java).",
+  "version": "1.1.0",
+  "description": "Format Java files and organize their imports from the CLI using the engine bundled in the Oracle Java extension (oracle.oracle-java).",
   "bin": {
     "kiro-java-format": "bin/kiro-java-format"
   },

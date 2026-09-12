@@ -12,8 +12,9 @@
  *
  * It launches `nbcode` as a Java Language Server (the exact same backend the
  * VS Code / Kiro extension uses), connects over the local socket, opens each
- * file, asks the server to format it (textDocument/formatting) and writes the
- * result back to disk.
+ * file, organizes its imports (the `source.organizeImports` code action), asks
+ * the server to format it (textDocument/formatting) and writes the result back
+ * to disk.
  *
  * No external npm dependencies. Node 16+.
  */
@@ -36,6 +37,7 @@ function parseArgs(argv) {
     tabSize: 4,
     insertSpaces: true,
     check: false,
+    organizeImports: true,
     timeoutMs: 120000,
     verbose: false,
   };
@@ -62,6 +64,9 @@ function parseArgs(argv) {
       case '--check':
         opts.check = true;
         break;
+      case '--no-organize-imports':
+        opts.organizeImports = false;
+        break;
       case '--timeout':
         opts.timeoutMs = parseInt(argv[++i], 10) * 1000;
         break;
@@ -85,15 +90,20 @@ function printHelp() {
 Usage:
   kiro-java-format [options] <file.java> [<file2.java> ...]
 
+Imports are organized before formatting, the same way the editor's
+"Organize Imports" does. Both steps read the project's code style
+(nb-configuration.xml for Maven projects).
+
 Options:
-  --root <dir>      Project root to open (default: nearest pom.xml/build.gradle, else file's dir)
-  --jdkhome <dir>   JDK 17+ home used to run the language server (auto-detected if omitted)
-  --tab-size <n>    Indent size hint sent to the formatter (default: 4)
-  --use-tabs        Indent with tabs instead of spaces
-  --check           Do not write; exit 1 if any file is not already formatted
-  --timeout <sec>   Max seconds to wait for the server (default: 120)
-  -v, --verbose     Print server / protocol diagnostics
-  -h, --help        Show this help
+  --root <dir>              Project root to open (default: nearest pom.xml/build.gradle, else file's dir)
+  --jdkhome <dir>           JDK 17+ home used to run the language server (auto-detected if omitted)
+  --tab-size <n>            Indent size hint sent to the formatter (default: 4)
+  --use-tabs                Indent with tabs instead of spaces
+  --check                   Do not write; exit 1 if any file is not already formatted
+  --no-organize-imports     Only format; leave the import block alone
+  --timeout <sec>           Max seconds to wait for the server (default: 120)
+  -v, --verbose             Print server / protocol diagnostics
+  -h, --help                Show this help
 
 Environment:
   KIRO_JAVA_EXT       Override path to the extension directory (the one containing nbcode/)
@@ -113,6 +123,18 @@ function fail(msg) {
 let VERBOSE = false;
 function vlog(...args) {
   if (VERBOSE) console.error('[kjf]', ...args);
+}
+
+/**
+ * How long to wait for the server to report that a file resolves, before
+ * organizing its imports. The first file pays for the project load; later files
+ * are answered immediately.
+ */
+const RESOLVE_WAIT_MS = 60000;
+const POLL_MS = 250;
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 // ---------------------------------------------------------------------------
@@ -413,6 +435,60 @@ function applyEdits(text, edits) {
   return out;
 }
 
+/** The whole document, as an LSP range. */
+function fullRange(text) {
+  const starts = lineStarts(text);
+  const lastLine = starts.length - 1;
+  return {
+    start: { line: 0, character: 0 },
+    end: { line: lastLine, character: text.length - starts[lastLine] },
+  };
+}
+
+/**
+ * Collect the TextEdits a WorkspaceEdit targets at one document.
+ *
+ * A WorkspaceEdit can carry either shape, so both are read. Edits for other
+ * documents are dropped: organizing one file's imports must not rewrite its
+ * neighbours, and the caller only ever holds the one file's text.
+ */
+function editsForUri(workspaceEdit, uri) {
+  if (!workspaceEdit) return [];
+  const out = [];
+  const changes = workspaceEdit.changes;
+  if (changes) {
+    for (const key of Object.keys(changes)) {
+      if (sameUri(key, uri) && Array.isArray(changes[key])) out.push(...changes[key]);
+    }
+  }
+  if (Array.isArray(workspaceEdit.documentChanges)) {
+    for (const change of workspaceEdit.documentChanges) {
+      const target = change && change.textDocument ? change.textDocument.uri : null;
+      if (target && sameUri(target, uri) && Array.isArray(change.edits)) out.push(...change.edits);
+    }
+  }
+  return out;
+}
+
+/**
+ * Compare two file URIs.
+ *
+ * The server may percent-encode differently than pathToFileURL does, so the
+ * decoded form is compared as well. Comparing the raw strings only would
+ * silently drop the edits for paths holding spaces or non-ASCII characters.
+ */
+function sameUri(a, b) {
+  if (a === b) return true;
+  const decode = (u) => {
+    try {
+      return decodeURI(u);
+    } catch {
+      return u;
+    }
+  };
+  return decode(a) === decode(b);
+}
+
 // ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
@@ -459,12 +535,51 @@ async function main() {
     client.onRequest('client/unregisterCapability', () => null);
     client.onRequest('window/workDoneProgress/create', () => null);
     client.onRequest('window/showMessageRequest', () => null);
-    client.onRequest('workspace/applyEdit', () => ({ applied: false }));
+
+    // Some code actions push their result instead of returning it. Keep the
+    // last pushed edit so the organize-imports step can pick it up; report it
+    // as applied because we do apply it, just to our own copy of the text.
+    let pushedEdit = null;
+    client.onRequest('workspace/applyEdit', (params) => {
+      if (params && params.edit) {
+        pushedEdit = params.edit;
+        return { applied: true };
+      }
+      return { applied: false };
+    });
+    const takePushedEdit = () => {
+      const edit = pushedEdit;
+      pushedEdit = null;
+      return edit;
+    };
+
+    // Organizing imports rewrites the whole import block from the types the
+    // compiler can resolve. Before the project's classpath is ready nothing
+    // resolves, so the server would drop every import it cannot see. Track
+    // diagnostics and only organize once the file compiles clean.
+    const diagnostics = new Map();
+    client.onNotification('textDocument/publishDiagnostics', (params) => {
+      if (!params || !params.uri) return;
+      diagnostics.set(params.uri, params.diagnostics || []);
+      if (process.env.KJF_DUMP) {
+        const errors = (params.diagnostics || []).filter((d) => d.severity === 1);
+        console.error(
+          `DIAG ${new Date().toISOString()} ${params.uri} total=${(params.diagnostics || []).length} errors=${errors.length}`,
+          errors.length > 0 ? JSON.stringify(errors.slice(0, 3)) : ''
+        );
+      }
+    });
+    const errorsFor = (uri) => {
+      for (const [key, list] of diagnostics) {
+        if (sameUri(key, uri)) return list.filter((d) => d.severity === 1);
+      }
+      return null; // nothing published yet
+    };
 
     const rootUri = pathToFileURL(rootDir).href;
-    await client.request('initialize', {
+    const initResult = await client.request('initialize', {
       processId: process.pid,
-      clientInfo: { name: 'kiro-java-format', version: '1.0.0' },
+      clientInfo: { name: 'kiro-java-format', version: '1.1.0' },
       locale: 'en',
       rootPath: rootDir,
       rootUri,
@@ -472,6 +587,22 @@ async function main() {
         textDocument: {
           synchronization: { dynamicRegistration: true, didSave: true },
           formatting: { dynamicRegistration: true },
+          // resolveSupport / dataSupport put the server on the lazy path: the
+          // code action comes back without an edit and we ask for it with
+          // codeAction/resolve. Without them the server has no way to hand the
+          // edit to a client that cannot apply workspace edits itself.
+          codeAction: {
+            dynamicRegistration: true,
+            isPreferredSupport: true,
+            dataSupport: true,
+            resolveSupport: { properties: ['edit'] },
+            codeActionLiteralSupport: {
+              codeActionKind: { valueSet: ['', 'source', 'source.organizeImports'] },
+            },
+          },
+          // Asked for so the server reports whether the file resolves. Organize
+          // imports is only safe once it does.
+          publishDiagnostics: { relatedInformation: false },
         },
         workspace: {
           applyEdit: true,
@@ -497,30 +628,121 @@ async function main() {
       },
       workspaceFolders: [{ uri: rootUri, name: path.basename(rootDir) }],
     });
+    if (process.env.KJF_DUMP) console.error('SERVER CAPS', JSON.stringify(initResult));
     client.notify('initialized', {});
+
+    /**
+     * Run the editor's "Organize Imports" on the open document.
+     *
+     * Returns the resulting text, or the input unchanged when the server has
+     * nothing to do. Formatting runs afterwards, so this only has to get the
+     * import block right — not its indentation.
+     */
+    /**
+     * Wait until the server reports the open document has no errors.
+     *
+     * This is the gate for organizing imports. The server rebuilds the import
+     * block from the types it can resolve, so running it while the classpath is
+     * still loading deletes every import it cannot see. "No errors" is the
+     * signal that resolution finished and the rebuild will keep what is used.
+     *
+     * Diagnostics can be published more than once as analysis progresses, so a
+     * clean result is awaited rather than the first result.
+     */
+    async function waitUntilResolves(uri) {
+      const deadline = Date.now() + RESOLVE_WAIT_MS;
+      for (;;) {
+        const errors = errorsFor(uri);
+        if (errors && errors.length === 0) return true;
+        if (Date.now() >= deadline) {
+          vlog(errors ? `still ${errors.length} error(s)` : 'no diagnostics received');
+          return false;
+        }
+        await sleep(POLL_MS);
+      }
+    }
+
+    async function organizeImports(uri, text) {
+      const actions = await client.request('textDocument/codeAction', {
+        textDocument: { uri },
+        range: fullRange(text),
+        context: { diagnostics: [], only: ['source.organizeImports'] },
+      });
+      if (process.env.KJF_DUMP) console.error('ACTIONS', JSON.stringify(actions));
+      // Only take the organize-imports action. Asking with `only` should give
+      // nothing else, but a Command (no `kind`) would be a different operation
+      // and running it blindly could change code, not imports.
+      const action = Array.isArray(actions)
+        ? actions.find((a) => a && a.kind === 'source.organizeImports')
+        : null;
+      if (!action) {
+        vlog('organize imports not offered, leaving imports as they are');
+        return text;
+      }
+
+      // The action arrives without an edit; the server computes it on resolve.
+      let resolved = action;
+      if (!resolved.edit) {
+        try {
+          resolved = await client.request('codeAction/resolve', action);
+        } catch (err) {
+          vlog('codeAction/resolve failed:', err.message);
+          return text;
+        }
+      }
+      const edit = (resolved && resolved.edit) || takePushedEdit();
+      const edits = editsForUri(edit, uri);
+      if (process.env.KJF_DUMP) console.error('IMPORT EDITS', JSON.stringify(edits));
+      if (edits.length === 0) return text;
+      return applyEdits(text, edits);
+    }
 
     for (const file of opts.files) {
       const uri = pathToFileURL(file).href;
       const original = fs.readFileSync(file, 'utf8');
+      let current = original;
 
-      client.notify('textDocument/didOpen', {
-        textDocument: { uri, languageId: 'java', version: 1, text: original },
-      });
+      const open = (text) =>
+        client.notify('textDocument/didOpen', {
+          textDocument: { uri, languageId: 'java', version: 1, text },
+        });
+      const close = () => client.notify('textDocument/didClose', { textDocument: { uri } });
+
+      // Drop what the server said about this path earlier so the gate below
+      // reads the result for this open, not a previous run's.
+      for (const key of [...diagnostics.keys()]) {
+        if (sameUri(key, uri)) diagnostics.delete(key);
+      }
+      open(current);
+
+      if (opts.organizeImports) {
+        if (await waitUntilResolves(uri)) {
+          const organized = await organizeImports(uri, current);
+          if (organized !== current) {
+            current = organized;
+            // Reopen so the server formats what we hold. Sending the formatting
+            // request against the pre-organize document would return edits
+            // whose ranges no longer line up with our text.
+            close();
+            open(current);
+          }
+        } else {
+          // Organizing now would drop the imports of everything that does not
+          // resolve. Formatting is still safe, so carry on with it.
+          console.log(`imports skipped (file does not resolve): ${file}`);
+        }
+      }
 
       const edits = await client.request('textDocument/formatting', {
         textDocument: { uri },
         options: { tabSize: opts.tabSize, insertSpaces: opts.insertSpaces },
       });
 
-      client.notify('textDocument/didClose', { textDocument: { uri } });
+      close();
 
       if (process.env.KJF_DUMP) console.error('EDITS', JSON.stringify(edits));
-      if (!edits || edits.length === 0) {
-        console.log(`unchanged: ${file}`);
-        continue;
-      }
-      const formatted = applyEdits(original, edits);
-      if (formatted === original) {
+      const result = edits && edits.length > 0 ? applyEdits(current, edits) : current;
+      if (result === original) {
         console.log(`unchanged: ${file}`);
         continue;
       }
@@ -528,7 +750,7 @@ async function main() {
         console.log(`would reformat: ${file}`);
         exitCode = 1;
       } else {
-        fs.writeFileSync(file, formatted, 'utf8');
+        fs.writeFileSync(file, result, 'utf8');
         console.log(`formatted: ${file}`);
       }
     }

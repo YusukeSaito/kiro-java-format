@@ -20,11 +20,52 @@ This tool:
 1. Finds the installed `oracle.oracle-java` extension and its `nbcode` launcher.
 2. Starts it as a language server (`nbcode --start-java-language-server=listen-hash:0`).
 3. Connects over a local socket and performs the auth handshake.
-4. Speaks LSP: `initialize` → `didOpen` → `textDocument/formatting`, applies the
-   returned edits to the file, then `shutdown`.
+4. Speaks LSP: `initialize` → `didOpen` → `source.organizeImports` code action →
+   `textDocument/formatting`, applies the returned edits to the file, then `shutdown`.
 
 It is a single dependency-free Node script — nothing is installed globally except a
 small symlink.
+
+## Imports
+
+Imports are organized before formatting, the same as the editor's **Organize Imports**:
+unused imports are dropped, `.*` imports are expanded or collapsed, and the block is
+grouped and sorted. Pass `--no-organize-imports` to format only.
+
+Both steps read your project's code style, so the result matches the editor. For Maven
+projects that is `nb-configuration.xml` at the project root, for example:
+
+```xml
+<project-shared-configuration>
+    <properties xmlns="http://www.netbeans.org/ns/maven-properties-data/1">
+        <org-netbeans-modules-editor-indent.CodeStyle.usedProfile>project</org-netbeans-modules-editor-indent.CodeStyle.usedProfile>
+        <!-- group order; an entry starting with `static ` takes the static imports,
+             and `*` takes whatever matched no other group -->
+        <org-netbeans-modules-editor-indent.text.x-java.CodeStyle.project.importGroupsOrder>java;javax;org;com;*;static *</org-netbeans-modules-editor-indent.text.x-java.CodeStyle.project.importGroupsOrder>
+        <!-- never collapse to `.*` -->
+        <org-netbeans-modules-editor-indent.text.x-java.CodeStyle.project.countForUsingStarImport>999</org-netbeans-modules-editor-indent.text.x-java.CodeStyle.project.countForUsingStarImport>
+        <org-netbeans-modules-editor-indent.text.x-java.CodeStyle.project.countForUsingStaticStarImport>999</org-netbeans-modules-editor-indent.text.x-java.CodeStyle.project.countForUsingStaticStarImport>
+        <org-netbeans-modules-editor-indent.text.x-java.CodeStyle.project.allowConvertToStarImport>true</org-netbeans-modules-editor-indent.text.x-java.CodeStyle.project.allowConvertToStarImport>
+        <org-netbeans-modules-editor-indent.text.x-java.CodeStyle.project.allowConvertToStaticStarImport>true</org-netbeans-modules-editor-indent.text.x-java.CodeStyle.project.allowConvertToStaticStarImport>
+    </properties>
+</project-shared-configuration>
+```
+
+`usedProfile` must be `project`, otherwise none of the other keys are read.
+
+### Files that do not compile keep their imports
+
+Organizing rebuilds the import block from the types the compiler can resolve, so a type
+it cannot see loses its import. The tool therefore waits for the server to report the
+file as error-free and **skips organizing** if it is not, printing:
+
+```
+imports skipped (file does not resolve): src/main/java/com/example/Foo.java
+```
+
+Formatting still runs. This is why the first file in a run takes longer than the rest:
+it waits for the project's classpath to load. Files with real compile errors are always
+reported this way — fix the errors, or pass `--no-organize-imports`.
 
 ## Requirements
 
@@ -88,9 +129,9 @@ find src -name '*.java' -print0 | xargs -0 kiro-java-format
 find src -name '*.java' -print0 | xargs -0 kiro-java-format --check
 ```
 
-> **Tip:** the first file is slow because the language server JVM has to boot. Pass
-> **many files in one invocation** to amortize that startup cost — don't call the
-> command once per file in a loop.
+> **Tip:** the first file is slow because the language server JVM has to boot and the
+> project's classpath has to load. Pass **many files in one invocation** to amortize
+> that startup cost — don't call the command once per file in a loop.
 
 ### Options
 
@@ -101,6 +142,7 @@ find src -name '*.java' -print0 | xargs -0 kiro-java-format --check
 | `--tab-size <n>` | Indent size hint (default `4`). |
 | `--use-tabs` | Indent with tabs instead of spaces. |
 | `--check` | Don't write; exit `1` if any file would change. |
+| `--no-organize-imports` | Only format; leave the import block alone. |
 | `--timeout <sec>` | Max seconds to wait for the server (default `120`). |
 | `-v`, `--verbose` | Print server / protocol diagnostics. |
 | `-h`, `--help` | Show help. |
