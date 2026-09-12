@@ -111,7 +111,9 @@ Environment:
 
 Exit codes:
   0  success (formatted, or already formatted in --check mode)
-  1  a file changed (in --check mode) or a runtime error occurred
+  1  a file changed (in --check mode), a file failed, or a runtime error occurred
+
+A file that fails is reported and skipped; the remaining files still run.
 `);
 }
 
@@ -663,11 +665,18 @@ async function main() {
     }
 
     async function organizeImports(uri, text) {
-      const actions = await client.request('textDocument/codeAction', {
-        textDocument: { uri },
-        range: fullRange(text),
-        context: { diagnostics: [], only: ['source.organizeImports'] },
-      });
+      let actions;
+      try {
+        actions = await client.request('textDocument/codeAction', {
+          textDocument: { uri },
+          range: fullRange(text),
+          context: { diagnostics: [], only: ['source.organizeImports'] },
+        });
+      } catch (err) {
+        // Leave the imports rather than the whole file: formatting still works.
+        vlog('textDocument/codeAction failed:', err.message);
+        return text;
+      }
       if (process.env.KJF_DUMP) console.error('ACTIONS', JSON.stringify(actions));
       // Only take the organize-imports action. Asking with `only` should give
       // nothing else, but a Command (no `kind`) would be a different operation
@@ -708,50 +717,64 @@ async function main() {
         });
       const close = () => client.notify('textDocument/didClose', { textDocument: { uri } });
 
-      // Drop what the server said about this path earlier so the gate below
-      // reads the result for this open, not a previous run's.
-      for (const key of [...diagnostics.keys()]) {
-        if (sameUri(key, uri)) diagnostics.delete(key);
-      }
-      open(current);
-
-      if (opts.organizeImports) {
-        if (await waitUntilResolves(uri)) {
-          const organized = await organizeImports(uri, current);
-          if (organized !== current) {
-            current = organized;
-            // Reopen so the server formats what we hold. Sending the formatting
-            // request against the pre-organize document would return edits
-            // whose ranges no longer line up with our text.
-            close();
-            open(current);
-          }
-        } else {
-          // Organizing now would drop the imports of everything that does not
-          // resolve. Formatting is still safe, so carry on with it.
-          console.log(`imports skipped (file does not resolve): ${file}`);
+      // One bad file must not abandon the rest: a run over a whole tree would
+      // then leave some files formatted and the remainder untouched, with no
+      // way to tell where it stopped.
+      try {
+        // Drop what the server said about this path earlier so the gate below
+        // reads the result for this open, not a previous run's.
+        for (const key of [...diagnostics.keys()]) {
+          if (sameUri(key, uri)) diagnostics.delete(key);
         }
-      }
+        open(current);
 
-      const edits = await client.request('textDocument/formatting', {
-        textDocument: { uri },
-        options: { tabSize: opts.tabSize, insertSpaces: opts.insertSpaces },
-      });
+        if (opts.organizeImports) {
+          if (await waitUntilResolves(uri)) {
+            const organized = await organizeImports(uri, current);
+            if (organized !== current) {
+              current = organized;
+              // Reopen so the server formats what we hold. Sending the
+              // formatting request against the pre-organize document would
+              // return edits whose ranges no longer line up with our text.
+              close();
+              open(current);
+            }
+          } else {
+            // Organizing now would drop the imports of everything that does not
+            // resolve. Formatting is still safe, so carry on with it.
+            console.log(`imports skipped (file does not resolve): ${file}`);
+          }
+        }
 
-      close();
+        const edits = await client.request('textDocument/formatting', {
+          textDocument: { uri },
+          options: { tabSize: opts.tabSize, insertSpaces: opts.insertSpaces },
+        });
 
-      if (process.env.KJF_DUMP) console.error('EDITS', JSON.stringify(edits));
-      const result = edits && edits.length > 0 ? applyEdits(current, edits) : current;
-      if (result === original) {
-        console.log(`unchanged: ${file}`);
-        continue;
-      }
-      if (opts.check) {
-        console.log(`would reformat: ${file}`);
+        close();
+
+        if (process.env.KJF_DUMP) console.error('EDITS', JSON.stringify(edits));
+        const result = edits && edits.length > 0 ? applyEdits(current, edits) : current;
+        if (result === original) {
+          console.log(`unchanged: ${file}`);
+          continue;
+        }
+        if (opts.check) {
+          console.log(`would reformat: ${file}`);
+          exitCode = 1;
+        } else {
+          fs.writeFileSync(file, result, 'utf8');
+          console.log(`formatted: ${file}`);
+        }
+      } catch (err) {
+        // Close so the server does not keep holding a document we abandoned.
+        try {
+          close();
+        } catch {
+          /* ignore */
+        }
+        console.error(`error: ${file}: ${err && err.message ? err.message : String(err)}`);
         exitCode = 1;
-      } else {
-        fs.writeFileSync(file, result, 'utf8');
-        console.log(`formatted: ${file}`);
       }
     }
 
