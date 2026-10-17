@@ -835,6 +835,106 @@ function updateLockFile(lockPath, nonce, fields) {
 }
 
 // ---------------------------------------------------------------------------
+// Reading and writing a file under a lock
+// ---------------------------------------------------------------------------
+
+class ChangedOnDiskError extends Error {
+  constructor() {
+    super('changed on disk while formatting; not written');
+    this.name = 'ChangedOnDiskError';
+  }
+}
+
+/**
+ * Overwrite `file` with `text`, unless its content is no longer `originalText`.
+ *
+ * The file is rewritten in place exactly as fs.writeFileSync(file) does, so
+ * its inode, owner, mode, extended attributes and hard links stay as they
+ * are, and a symlink is written through. Returns the fstat taken right after
+ * the write. Throws ChangedOnDiskError when someone else changed the file
+ * since it was read: writing then would throw their change away.
+ */
+function writeFileIfUnchanged(file, text, originalText) {
+  if (fs.readFileSync(file, 'utf8') !== originalText) throw new ChangedOnDiskError();
+  const fd = fs.openSync(file, 'w');
+  try {
+    fs.writeFileSync(fd, text, 'utf8');
+    return fs.fstatSync(fd);
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
+function resolveLockDir(cacheRoot) {
+  return path.join(cacheRoot, 'locks');
+}
+
+/** The file locks this process holds (lock path → nonce), so a signal handler can release them. */
+const heldFileLocks = new Map();
+
+/**
+ * Take the lock for one file, waiting up to `timeoutMs` for another run of
+ * this tool to finish with it. Returns `{ lockPath, nonce }`, or null when the
+ * file is to be processed without a lock: the wait hit its limit, or no lock
+ * can be made. Either way the write is still guarded by writeFileIfUnchanged.
+ */
+async function acquireFileLock(file, timeoutMs) {
+  let lockPath;
+  try {
+    const lockDir = ensurePrivateDir(resolveLockDir(resolveCurrentCacheRoot()));
+    const key = crypto.createHash('sha256').update(fs.realpathSync(file)).digest('hex').slice(0, 16);
+    lockPath = path.join(lockDir, `${key}.lock`);
+  } catch (err) {
+    vlog(`no lock for ${file} (${err.message}); continuing without the lock`);
+    return null;
+  }
+  const deadlineMs = Date.now() + timeoutMs;
+  for (;;) {
+    const r = acquireLockFile(lockPath, {});
+    if (r.kind === 'acquired') {
+      heldFileLocks.set(lockPath, r.nonce);
+      return { lockPath, nonce: r.nonce };
+    }
+    if (r.kind === 'unusable') {
+      vlog(`no lock for ${file} (${r.reason}); continuing without the lock`);
+      return null;
+    }
+    let read;
+    try {
+      read = readLockRecord(lockPath);
+    } catch (err) {
+      vlog(`no lock for ${file} (${err.message}); continuing without the lock`);
+      return null;
+    }
+    if ((await isLockStale(read, Date.now())) && breakStaleLock(lockPath, read)) continue;
+    if (hasDeadlinePassed(deadlineMs)) {
+      vlog(`lock wait limit reached for ${file}; continuing without the lock`);
+      return null;
+    }
+    await waitMs(LOCK_RETRY_MS);
+  }
+}
+
+function releaseFileLock(lock) {
+  releaseLockFile(lock.lockPath, lock.nonce);
+  heldFileLocks.delete(lock.lockPath);
+}
+
+/**
+ * Run `fn` while holding the lock for `file` (by real path, so a symlink and
+ * its target share one lock). Two runs of this tool on the same file then
+ * take turns, and the second finds the first one's result.
+ */
+async function runWithFileLock(file, timeoutMs, fn) {
+  const lock = await acquireFileLock(file, timeoutMs);
+  try {
+    return await fn();
+  } finally {
+    if (lock) releaseFileLock(lock);
+  }
+}
+
+// ---------------------------------------------------------------------------
 // One running language server and the documents open in it
 // ---------------------------------------------------------------------------
 
@@ -1130,8 +1230,15 @@ class ServerSession {
  * One bad file must not abandon the rest: a run over a whole tree would then
  * leave some files formatted and the remainder untouched, with no way to tell
  * where it stopped. So failures are reported here and not thrown.
+ *
+ * The file is read, formatted and written under its lock, so another run of
+ * this tool on the same file waits instead of reading a half-written file.
  */
-async function formatOneFile(session, file, opts) {
+function formatOneFile(session, file, opts) {
+  return runWithFileLock(file, opts.timeoutMs, () => formatLockedFile(session, file, opts));
+}
+
+async function formatLockedFile(session, file, opts) {
   const uri = pathToFileURL(file).href;
   const original = fs.readFileSync(file, 'utf8');
   let current = original;
@@ -1171,7 +1278,7 @@ async function formatOneFile(session, file, opts) {
       console.log(`would reformat: ${file}`);
       return 1;
     }
-    fs.writeFileSync(file, result, 'utf8');
+    writeFileIfUnchanged(file, result, original);
     console.log(`formatted: ${file}`);
     return 0;
   } catch (err) {
@@ -1317,4 +1424,8 @@ module.exports = {
   updateLockFile,
   LOCK_PID_CHECK_AGE_MS,
   LOCK_UNPARSABLE_STALE_MS,
+  ChangedOnDiskError,
+  writeFileIfUnchanged,
+  resolveLockDir,
+  runWithFileLock,
 };
