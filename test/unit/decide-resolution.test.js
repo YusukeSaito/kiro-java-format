@@ -134,6 +134,49 @@ test('other messages are not the scan signal', () => {
   assert.deepStrictEqual(s.indexPhase, { kind: 'indexing' });
 });
 
+function attachClient(s, reply) {
+  const sent = [];
+  s.client = {
+    request: (method, params) => {
+      sent.push(method);
+      return reply();
+    },
+  };
+  return sent;
+}
+
+test('a successful workspace/symbol reply is the scan signal; it is sent once, after the first diagnostics', async () => {
+  const s = createSession();
+  const sent = attachClient(s, () => Promise.resolve([]));
+  assert.deepStrictEqual(sent, []);
+  s.handleDiagnostics({ uri: 'file:///p/A.java', diagnostics: [] });
+  s.handleDiagnostics({ uri: 'file:///p/B.java', diagnostics: [] });
+  assert.deepStrictEqual(sent, ['workspace/symbol']);
+  await new Promise((r) => setImmediate(r));
+  assert.strictEqual(s.hasScanFinishedSignal, true);
+  assert.strictEqual(s.indexPhase.kind, 'complete');
+});
+
+test('a failed or timed-out workspace/symbol is not the scan signal', async () => {
+  const s = createSession();
+  attachClient(s, () => Promise.reject(new Error('Timed out after 120s')));
+  s.handleDiagnostics({ uri: 'file:///p/A.java', diagnostics: [] });
+  await new Promise((r) => setImmediate(r));
+  assert.strictEqual(s.hasScanFinishedSignal, false);
+  assert.deepStrictEqual(s.indexPhase, { kind: 'indexing' });
+});
+
+test('the workspace/symbol signal still waits for running progress to end', async () => {
+  const s = createSession();
+  attachClient(s, () => Promise.resolve([]));
+  s.handleProgress({ token: 'scan', value: { kind: 'begin' } });
+  s.handleDiagnostics({ uri: 'file:///p/A.java', diagnostics: [] });
+  await new Promise((r) => setImmediate(r));
+  assert.deepStrictEqual(s.indexPhase, { kind: 'indexing' });
+  s.handleProgress({ token: 'scan', value: { kind: 'end' } });
+  assert.strictEqual(s.indexPhase.kind, 'complete');
+});
+
 test('a diagnostics entry from before the document was opened is ignored', () => {
   const s = createSession();
   s.handleDiagnostics({ uri: 'file:///p/A.java', diagnostics: [{ severity: 1 }, { severity: 2 }] });

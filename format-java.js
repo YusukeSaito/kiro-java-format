@@ -1420,9 +1420,13 @@ class ServerSession {
     // diagnostics (uri → { errorCount, arrivedAtMs }, latest only) and only
     // organize once the file compiles clean.
     this.diagnostics = new Map();
-    // Indexing state, from `$/progress` and the scan's "Indexing completed.".
+    // Indexing state, from `$/progress` and the scan-finished signals
+    // ("Indexing completed.", or the reply to the workspace/symbol probe).
     this.activeProgressTokens = new Set();
     this.hasScanFinishedSignal = false;
+    this.hasSentScanProbe = false;
+    // The per-wait limit (--timeout), for requests the session sends itself.
+    this.timeoutMs = undefined;
     this.completionCount = 0;
     this.indexPhase = { kind: 'indexing' };
     // A reused (cached) index can report a file clean before the index is
@@ -1451,6 +1455,7 @@ class ServerSession {
   static async start({ nbcodePath, jdkHome, userdir, rootDir, timeoutMs, isTemporaryUserdir }) {
     const { proc, listening } = startServer(nbcodePath, jdkHome, userdir);
     const session = new ServerSession(proc);
+    session.timeoutMs = timeoutMs;
     const isPosix = process.platform !== 'win32';
     session.watchdogConfig = {
       pgid: isPosix ? proc.pid : null,
@@ -1600,7 +1605,27 @@ class ServerSession {
   handleShowMessage(params) {
     if (!params || typeof params.message !== 'string') return;
     if (params.message.trim() !== 'Indexing completed.') return;
-    vlog(`+${this.measureElapsedMs()}ms scan finished signal: Indexing completed.`);
+    this.acceptScanFinishedSignal('Indexing completed.');
+  }
+
+  /**
+   * The second way to learn the initial scan finished: NBLS answers
+   * workspace/symbol only once the scan is done, whatever the message
+   * language. Sent once, after the first diagnostics (by then the projects
+   * are open). Only a successful reply counts; an error or a timeout is not
+   * a signal.
+   */
+  sendScanProbe() {
+    if (this.hasSentScanProbe || !this.client) return;
+    this.hasSentScanProbe = true;
+    this.client.request('workspace/symbol', { query: 'KjfScanFinishedProbe' }, this.timeoutMs).then(
+      () => this.acceptScanFinishedSignal('workspace/symbol reply'),
+      (err) => vlog(`+${this.measureElapsedMs()}ms workspace/symbol failed, not a scan signal: ${err.message}`)
+    );
+  }
+
+  acceptScanFinishedSignal(source) {
+    vlog(`+${this.measureElapsedMs()}ms scan finished signal: ${source}`);
     this.hasScanFinishedSignal = true;
     this.updateIndexPhase();
   }
@@ -1619,6 +1644,7 @@ class ServerSession {
       );
     }
     this.events.emit('diagnostics', params.uri);
+    this.sendScanProbe();
   }
 
   /**
