@@ -24,6 +24,7 @@ const os = require('os');
 const path = require('path');
 const net = require('net');
 const crypto = require('crypto');
+const { EventEmitter } = require('events');
 const { spawn, execFile, execFileSync } = require('child_process');
 const { pathToFileURL } = require('url');
 
@@ -134,13 +135,13 @@ function vlog(...args) {
  * are answered immediately.
  */
 const RESOLVE_WAIT_MS = 60000;
-const POLL_MS = 250;
+/**
+ * Once indexing has completed, a file whose errors stay unchanged for this
+ * long does not resolve, and waiting longer would not change that.
+ */
+const POST_INDEX_SETTLE_MS = 2000;
 /** How long a normal exit waits for the server to acknowledge `shutdown`. */
 const SHUTDOWN_WAIT_MS = 2000;
-
-function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
 
 /** Pause between retries of a lock (or another poll that has no event to wait for). */
 function waitMs(ms) {
@@ -1344,6 +1345,56 @@ async function runWithFileLock(file, timeoutMs, fn) {
 }
 
 // ---------------------------------------------------------------------------
+// Deciding whether a file resolves
+// ---------------------------------------------------------------------------
+
+/**
+ * The diagnostics entry that answers a request for fresh diagnostics: only
+ * one that arrived after the request was sent, else null.
+ */
+function selectEntryAfterRequest(entry, freshRequest) {
+  if (freshRequest === null || entry === null) return null;
+  return entry.arrivedAtMs >= freshRequest.requestedAtMs ? entry : null;
+}
+
+/**
+ * Whether an open document resolves (organizing its imports is safe), does
+ * not, or cannot be told yet. Pure; every input is passed in.
+ *
+ * - `entry`: the latest diagnostics for the document since it was opened
+ *   (`{ errorCount, arrivedAtMs }`), or null
+ * - `indexPhase`: `{ kind: 'indexing' }` or `{ kind: 'complete', completionCount, completedAtMs }`
+ * - `capMs`: the longest wait, counted from `openedAtMs`
+ * - `settleMs`: how long errors must stay unchanged after indexing
+ *
+ * Returns `{ kind: 'resolved' }`, `{ kind: 'unresolved', reason }` (reason
+ * 'errors after indexing' or 'wait limit'), or `{ kind: 'pending', wakeAtMs,
+ * shouldRequestFreshDiagnostics }`, where `wakeAtMs` is when the answer can
+ * change with time alone (the limit, when nothing earlier).
+ */
+function decideResolution({ entry, indexPhase, openedAtMs, nowMs, capMs, settleMs }) {
+  const capAtMs = openedAtMs + capMs;
+  const pending = (wakeAtMs = capAtMs) => ({ kind: 'pending', wakeAtMs, shouldRequestFreshDiagnostics: false });
+
+  // At the limit, the latest result decides. (A NaN limit counts as reached.)
+  if (!(nowMs < capAtMs)) {
+    return entry !== null && entry.errorCount === 0 ? { kind: 'resolved' } : { kind: 'unresolved', reason: 'wait limit' };
+  }
+  // No errors: resolved, even before indexing completes (a fresh index has
+  // nothing stale to report).
+  if (entry !== null && entry.errorCount === 0) return { kind: 'resolved' };
+  // Errors reported after indexing completed, and unchanged for settleMs: the
+  // file does not resolve, and waiting longer would not change that.
+  if (entry !== null && indexPhase.kind === 'complete') {
+    // Errors from before completion are recomputed after it; wait for that.
+    if (entry.arrivedAtMs < indexPhase.completedAtMs) return pending();
+    const settledAtMs = entry.arrivedAtMs + settleMs;
+    return nowMs >= settledAtMs ? { kind: 'unresolved', reason: 'errors after indexing' } : pending(settledAtMs);
+  }
+  return pending();
+}
+
+// ---------------------------------------------------------------------------
 // One running language server and the documents open in it
 // ---------------------------------------------------------------------------
 
@@ -1360,13 +1411,25 @@ class ServerSession {
     this.proc = proc;
     this.socket = null;
     this.client = null;
+    this.startedAtMs = Date.now();
     // Set when the server process exits: `{ code }`.
     this.exitInfo = null;
     // Organizing imports rewrites the whole import block from the types the
     // compiler can resolve. Before the project's classpath is ready nothing
     // resolves, so the server would drop every import it cannot see. Track
-    // diagnostics and only organize once the file compiles clean.
+    // diagnostics (uri → { errorCount, arrivedAtMs }, latest only) and only
+    // organize once the file compiles clean.
     this.diagnostics = new Map();
+    // Indexing state, from `$/progress` and the scan's "Indexing completed.".
+    this.activeProgressTokens = new Set();
+    this.hasScanFinishedSignal = false;
+    this.completionCount = 0;
+    this.indexPhase = { kind: 'indexing' };
+    // A reused (cached) index can report a file clean before the index is
+    // brought up to date, so with one only results after indexing count.
+    this.isPersistentUserdir = false;
+    // 'diagnostics' (uri), 'indexPhase', 'exit'
+    this.events = new EventEmitter();
     // Some code actions push their result instead of returning it. Keep the
     // last pushed edit so the organize-imports step can pick it up.
     this.pushedEdit = null;
@@ -1374,6 +1437,7 @@ class ServerSession {
       this.exitInfo = { code };
       vlog('server exited, code', code);
       if (this.client) this.client.rejectAll(new ServerExitedError(code));
+      this.events.emit('exit');
     });
   }
 
@@ -1448,17 +1512,9 @@ class ServerSession {
       return { applied: false };
     });
 
-    client.onNotification('textDocument/publishDiagnostics', (params) => {
-      if (!params || !params.uri) return;
-      this.diagnostics.set(params.uri, params.diagnostics || []);
-      if (process.env.KJF_DUMP) {
-        const errors = (params.diagnostics || []).filter((d) => d.severity === 1);
-        console.error(
-          `DIAG ${new Date().toISOString()} ${params.uri} total=${(params.diagnostics || []).length} errors=${errors.length}`,
-          errors.length > 0 ? JSON.stringify(errors.slice(0, 3)) : ''
-        );
-      }
-    });
+    client.onNotification('textDocument/publishDiagnostics', (params) => this.handleDiagnostics(params));
+    client.onNotification('$/progress', (params) => this.handleProgress(params));
+    client.onNotification('window/showMessage', (params) => this.handleShowMessage(params));
   }
 
   async initialize(rootDir, timeoutMs) {
@@ -1519,37 +1575,129 @@ class ServerSession {
     client.notify('initialized', {});
   }
 
-  /** The errors last published for `uri`, or null when nothing was published yet. */
-  findErrors(uri) {
-    for (const [key, list] of this.diagnostics) {
-      if (sameUri(key, uri)) return list.filter((d) => d.severity === 1);
+  /** Milliseconds since this session started, for -v. */
+  measureElapsedMs() {
+    return Date.now() - this.startedAtMs;
+  }
+
+  handleProgress(params) {
+    if (!params || params.token === undefined || !params.value) return;
+    const token = String(params.token);
+    if (params.value.kind === 'begin') {
+      this.activeProgressTokens.add(token);
+      vlog(`+${this.measureElapsedMs()}ms progress begin ${token}: ${params.value.title || ''}`);
+      if (this.indexPhase.kind === 'complete') {
+        this.indexPhase = { kind: 'indexing' };
+        this.events.emit('indexPhase');
+      }
+    } else if (params.value.kind === 'end') {
+      this.activeProgressTokens.delete(token);
+      vlog(`+${this.measureElapsedMs()}ms progress end ${token}`);
+      this.updateIndexPhase();
+    }
+  }
+
+  handleShowMessage(params) {
+    if (!params || typeof params.message !== 'string') return;
+    if (params.message.trim() !== 'Indexing completed.') return;
+    vlog(`+${this.measureElapsedMs()}ms scan finished signal: Indexing completed.`);
+    this.hasScanFinishedSignal = true;
+    this.updateIndexPhase();
+  }
+
+  handleDiagnostics(params) {
+    if (!params || !params.uri) return;
+    const list = params.diagnostics || [];
+    const errorCount = list.filter((d) => d.severity === 1).length;
+    this.diagnostics.set(params.uri, { errorCount, arrivedAtMs: Date.now() });
+    vlog(`+${this.measureElapsedMs()}ms diagnostics ${params.uri}: ${errorCount} error(s)`);
+    if (process.env.KJF_DUMP) {
+      const errors = list.filter((d) => d.severity === 1);
+      console.error(
+        `DIAG ${new Date().toISOString()} ${params.uri} total=${list.length} errors=${errors.length}`,
+        errors.length > 0 ? JSON.stringify(errors.slice(0, 3)) : ''
+      );
+    }
+    this.events.emit('diagnostics', params.uri);
+  }
+
+  /**
+   * Indexing is complete when the scan has signalled it finished and no
+   * progress is running. A progress that ends without the signal (the
+   * "Collecting workspace projects" step comes first) does not complete it.
+   */
+  updateIndexPhase() {
+    if (!this.hasScanFinishedSignal || this.activeProgressTokens.size > 0) return;
+    if (this.indexPhase.kind === 'complete') return;
+    this.completionCount += 1;
+    this.indexPhase = { kind: 'complete', completionCount: this.completionCount, completedAtMs: Date.now() };
+    vlog(`+${this.measureElapsedMs()}ms indexing complete (${this.completionCount})`);
+    this.events.emit('indexPhase');
+  }
+
+  /** The latest diagnostics entry for `uri` that arrived at or after `sinceMs`, or null. */
+  findDiagnosticEntry(uri, sinceMs) {
+    for (const [key, entry] of this.diagnostics) {
+      if (sameUri(key, uri)) return entry.arrivedAtMs >= sinceMs ? entry : null;
     }
     return null;
   }
 
   /**
-   * Wait until the server reports the open document has no errors.
+   * Wait until it is clear whether the open document resolves; resolves to
+   * `{ isResolved, reason }`.
    *
    * This is the gate for organizing imports. The server rebuilds the import
    * block from the types it can resolve, so running it while the classpath is
-   * still loading deletes every import it cannot see. "No errors" is the
-   * signal that resolution finished and the rebuild will keep what is used.
-   *
-   * Diagnostics can be published more than once as analysis progresses, so a
-   * clean result is awaited rather than the first result.
+   * still loading deletes every import it cannot see. The decision itself is
+   * decideResolution; this re-evaluates it whenever diagnostics for the
+   * document arrive, the indexing state changes, or the time it named passes.
    */
-  async waitUntilResolves(uri, capMs) {
-    const deadline = Date.now() + capMs;
-    for (;;) {
-      if (this.exitInfo) throw new ServerExitedError(this.exitInfo.code);
-      const errors = this.findErrors(uri);
-      if (errors && errors.length === 0) return true;
-      if (hasDeadlinePassed(deadline)) {
-        vlog(errors ? `still ${errors.length} error(s)` : 'no diagnostics received');
-        return false;
-      }
-      await sleep(POLL_MS);
-    }
+  waitForResolution(doc, capMs) {
+    return new Promise((resolve, reject) => {
+      let timer = null;
+      const stop = () => {
+        clearTimeout(timer);
+        this.events.removeListener('diagnostics', onDiagnostics);
+        this.events.removeListener('indexPhase', evaluate);
+        this.events.removeListener('exit', evaluate);
+      };
+      const evaluate = () => {
+        if (this.exitInfo) {
+          stop();
+          reject(new ServerExitedError(this.exitInfo.code));
+          return;
+        }
+        const nowMs = Date.now();
+        const decision = decideResolution({
+          entry: this.findDiagnosticEntry(doc.uri, doc.openedAtMs),
+          indexPhase: this.indexPhase,
+          isPersistentUserdir: this.isPersistentUserdir,
+          completionCountAtOpen: doc.completionCountAtOpen,
+          freshRequest: doc.freshRequest,
+          openedAtMs: doc.openedAtMs,
+          nowMs,
+          capMs,
+          settleMs: POST_INDEX_SETTLE_MS,
+        });
+        if (decision.kind === 'pending') {
+          clearTimeout(timer);
+          timer = setTimeout(evaluate, Math.max(0, decision.wakeAtMs - nowMs));
+          return;
+        }
+        stop();
+        const reason = decision.kind === 'resolved' ? 'resolves' : decision.reason;
+        vlog(`+${this.measureElapsedMs()}ms ${doc.uri}: ${reason} after ${nowMs - doc.openedAtMs}ms`);
+        resolve({ isResolved: decision.kind === 'resolved', reason: decision.kind === 'resolved' ? null : decision.reason });
+      };
+      const onDiagnostics = (uri) => {
+        if (sameUri(uri, doc.uri)) evaluate();
+      };
+      this.events.on('diagnostics', onDiagnostics);
+      this.events.on('indexPhase', evaluate);
+      this.events.on('exit', evaluate);
+      evaluate();
+    });
   }
 
   /**
@@ -1562,7 +1710,14 @@ class ServerSession {
     for (const key of [...this.diagnostics.keys()]) {
       if (sameUri(key, uri)) this.diagnostics.delete(key);
     }
-    const doc = { uri, version: 1, serverText: normalizeLineEndings(text), openedAtMs: Date.now() };
+    const doc = {
+      uri,
+      version: 1,
+      serverText: normalizeLineEndings(text),
+      openedAtMs: Date.now(),
+      completionCountAtOpen: this.completionCount,
+      freshRequest: null,
+    };
     this.client.notify('textDocument/didOpen', {
       textDocument: { uri, languageId: 'java', version: doc.version, text },
     });
@@ -1714,7 +1869,8 @@ async function formatLockedFile(session, file, opts) {
     doc = session.openDocument(uri, current);
 
     if (opts.organizeImports) {
-      if (await session.waitUntilResolves(uri, Math.min(RESOLVE_WAIT_MS, opts.timeoutMs))) {
+      const resolution = await session.waitForResolution(doc, Math.min(RESOLVE_WAIT_MS, opts.timeoutMs));
+      if (resolution.isResolved) {
         const organized = await session.organizeImports(doc, current, opts.timeoutMs);
         if (organized !== current) {
           current = organized;
@@ -1920,4 +2076,8 @@ module.exports = {
   parseProcStat,
   findProcessesUsingUserdir,
   terminateServerProcesses,
+  decideResolution,
+  selectEntryAfterRequest,
+  ServerSession,
+  POST_INDEX_SETTLE_MS,
 };
