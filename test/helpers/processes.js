@@ -16,11 +16,14 @@ function listProcessesWithToken(token) {
   return found;
 }
 
-/** Wait until no process carries `token`; returns what is still left at the deadline. */
-async function waitForNoProcessesWithToken(token, timeoutMs) {
+/**
+ * Wait until no process carries `token` (other than `exceptPids`); returns
+ * what is still left at the deadline.
+ */
+async function waitForNoProcessesWithToken(token, timeoutMs, { exceptPids = [] } = {}) {
   const deadline = Date.now() + timeoutMs;
   for (;;) {
-    const left = listProcessesWithToken(token);
+    const left = listProcessesWithToken(token).filter((p) => !exceptPids.includes(p.pid));
     if (left.length === 0 || Date.now() >= deadline) return left;
     await new Promise((r) => setTimeout(r, 200));
   }

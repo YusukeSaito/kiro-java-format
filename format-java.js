@@ -470,7 +470,15 @@ function startServer(nbcodePath, jdkHome, userdir) {
   args.push('-J--add-exports=jdk.compiler/com.sun.tools.javac.resources=ALL-UNNAMED');
 
   vlog('spawn', nbcodePath, args.join(' '));
-  const proc = spawn(nbcodePath, args, { cwd: userdir, stdio: ['ignore', 'pipe', 'pipe'] });
+  // On POSIX the launcher leads a process group of its own (pgid = its pid),
+  // so the JVM it runs as a child can be stopped with it, and a Ctrl-C in the
+  // terminal reaches only this CLI, which then stops the server itself.
+  const proc = spawn(nbcodePath, args, {
+    cwd: userdir,
+    stdio: ['ignore', 'pipe', 'pipe'],
+    detached: process.platform !== 'win32',
+    windowsHide: true,
+  });
 
   const listening = new Promise((resolve, reject) => {
     let started = false;
@@ -748,6 +756,327 @@ async function inspectToolProcess(pid, { shouldVerifyCommandLine }) {
   } catch (err) {
     return { isAvailable: false, reason: err.message };
   }
+}
+
+function escapeRegExp(s) {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+/**
+ * Whether a command line (as `ps` or Windows reports it) passes exactly
+ * `userdir` to nbcode: `--userdir <userdir>` or `-Dnetbeans.user=<userdir>`,
+ * plain or in double quotes, followed by a space or the end. A longer path
+ * that merely starts with `userdir` does not count.
+ */
+function hasUserdirToken(commandLine, userdir, { isCaseInsensitive = false } = {}) {
+  const u = escapeRegExp(userdir);
+  const patterns = [
+    `(^|\\s)--userdir\\s+${u}(?=\\s|$)`,
+    `(^|\\s)--userdir\\s+"${u}"(?=[\\s"]|$)`,
+    `(^|\\s)-Dnetbeans\\.user=${u}(?=\\s|$)`,
+    `(^|\\s)"-Dnetbeans\\.user=${u}"(?=[\\s"]|$)`,
+  ];
+  return patterns.some((p) => new RegExp(p, isCaseInsensitive ? 'i' : '').test(commandLine));
+}
+
+/** The same check on an argument vector (Linux /proc/<pid>/cmdline). */
+function hasUserdirTokenInArgv(argv, userdir) {
+  for (let i = 0; i < argv.length; i++) {
+    if (argv[i] === '--userdir' && argv[i + 1] === userdir) return true;
+    if (argv[i] === `-Dnetbeans.user=${userdir}`) return true;
+  }
+  return false;
+}
+
+/**
+ * The pid and process group of a /proc/<pid>/stat line. The command name in
+ * parentheses may itself hold spaces and parentheses, so fields are counted
+ * from the last `)`.
+ */
+function parseProcStat(line) {
+  const close = line.lastIndexOf(')');
+  const pid = parseInt(line.slice(0, line.indexOf('(')).trim(), 10);
+  const fields = line.slice(close + 1).trim().split(/\s+/);
+  return { pid, pgid: parseInt(fields[2], 10) };
+}
+
+/**
+ * The processes started with `userdir` (the nbcode launcher and its JVM).
+ * Returns `{ isAvailable: false, reason }` when processes cannot be listed,
+ * otherwise `{ isAvailable: true, processes: [{ pid, pgid }] }` (pgid is
+ * missing on Windows).
+ */
+async function findProcessesUsingUserdir(userdir) {
+  try {
+    if (process.platform === 'linux') {
+      let names;
+      try {
+        names = fs.readdirSync('/proc');
+      } catch (err) {
+        return { isAvailable: false, reason: err.message };
+      }
+      const processes = [];
+      for (const name of names) {
+        if (!/^\d+$/.test(name) || Number(name) === process.pid) continue;
+        try {
+          const argv = fs.readFileSync(`/proc/${name}/cmdline`, 'utf8').split('\0').filter(Boolean);
+          if (!hasUserdirTokenInArgv(argv, userdir)) continue;
+          processes.push(parseProcStat(fs.readFileSync(`/proc/${name}/stat`, 'utf8')));
+        } catch {
+          /* gone, or not ours to read */
+        }
+      }
+      return { isAvailable: true, processes };
+    }
+    if (process.platform === 'win32') {
+      const r = await runCommand(findPowerShell(), [
+        '-NoProfile',
+        '-NonInteractive',
+        '-Command',
+        'Get-CimInstance Win32_Process | Select-Object ProcessId,CommandLine | ConvertTo-Json -Compress',
+      ]);
+      if (r.code !== 0) return { isAvailable: false, reason: `powershell exited ${r.code}` };
+      const list = [].concat(JSON.parse(r.stdout || '[]'));
+      const processes = list
+        .filter((p) => p && p.CommandLine && hasUserdirToken(p.CommandLine, userdir, { isCaseInsensitive: true }))
+        .map((p) => ({ pid: p.ProcessId }));
+      return { isAvailable: true, processes };
+    }
+    const r = await runCommand('ps', ['-ww', '-axo', 'pid=,pgid=,command=']);
+    if (r.code !== 0) return { isAvailable: false, reason: `ps exited ${r.code}` };
+    const processes = [];
+    for (const line of r.stdout.split('\n')) {
+      const m = line.match(/^\s*(\d+)\s+(\d+)\s+(.*)$/);
+      if (!m || Number(m[1]) === process.pid) continue;
+      if (hasUserdirToken(m[3], userdir)) processes.push({ pid: Number(m[1]), pgid: Number(m[2]) });
+    }
+    return { isAvailable: true, processes };
+  } catch (err) {
+    return { isAvailable: false, reason: err.message };
+  }
+}
+
+function runTaskkill(args) {
+  return runCommand(path.win32.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'taskkill.exe'), args).catch(
+    () => ({ code: -1, stdout: '' })
+  );
+}
+
+/**
+ * Signal the language server this process spawned, with its whole process
+ * group (the launcher runs the JVM as a child). Only while Node has not
+ * reaped the launcher: until then its pid, which is the group id, cannot have
+ * been reused.
+ */
+function signalOwnServer(child, signal) {
+  if (child.exitCode !== null || child.signalCode !== null) return;
+  try {
+    if (process.platform === 'win32') {
+      runTaskkill(['/PID', String(child.pid), '/T', ...(signal === 'SIGKILL' ? ['/F'] : [])]);
+    } else {
+      process.kill(-child.pid, signal);
+    }
+  } catch (err) {
+    vlog('could not signal the language server:', err.message);
+  }
+}
+
+/** How long a language server gets to exit after SIGTERM before it is killed. */
+const JVM_EXIT_GRACE_MS = 10000;
+
+/**
+ * Stop the language server started with `userdir` and confirm it is gone.
+ * Returns `{ isTerminated }`; false means it could not be confirmed, and the
+ * caller must then leave the userdir and its locks in place.
+ *
+ * Only processes carrying `userdir` on their command line are signalled. The
+ * whole group is signalled only when every such process is in the group the
+ * launcher leads; on Windows the tree is killed only when the launcher itself
+ * is among them, since a recycled pid would take an unrelated tree with it.
+ * `deps` replaces the process queries and signals in tests.
+ */
+async function terminateServerProcesses({ pgid, launcherPid, userdir }, graceMs, deps = {}) {
+  const find = deps.find || findProcessesUsingUserdir;
+  const kill = deps.kill || ((pid, signal) => process.kill(pid, signal));
+  const taskkill = deps.taskkill || runTaskkill;
+  const platform = deps.platform || process.platform;
+  const wait = deps.wait || waitMs;
+  const isAlive = (pid) => {
+    try {
+      kill(pid, 0);
+      return true;
+    } catch {
+      return false;
+    }
+  };
+  const trySignal = (pid, signal) => {
+    try {
+      kill(pid, signal);
+    } catch {
+      /* already gone */
+    }
+  };
+
+  const first = await find(userdir);
+  if (!first.isAvailable) {
+    vlog('cannot list processes:', first.reason);
+    if (platform !== 'win32' && Number.isInteger(pgid) && pgid > 1 && isAlive(launcherPid)) {
+      trySignal(-pgid, 'SIGTERM');
+      await wait(graceMs);
+      if (isAlive(launcherPid)) trySignal(-pgid, 'SIGKILL');
+    }
+    return { isTerminated: false };
+  }
+  if (first.processes.length === 0) return { isTerminated: true };
+
+  const sendAll = async (processes, signal) => {
+    if (platform === 'win32') {
+      if (processes.some((p) => p.pid === launcherPid)) {
+        await taskkill(['/PID', String(launcherPid), '/T', ...(signal === 'SIGKILL' ? ['/F'] : [])]);
+      } else {
+        for (const p of processes) await taskkill(['/PID', String(p.pid), '/F']);
+      }
+      return;
+    }
+    const isOwnGroup =
+      Number.isInteger(pgid) && pgid > 1 && pgid === launcherPid && processes.every((p) => p.pgid === pgid);
+    if (isOwnGroup) trySignal(-pgid, signal);
+    else for (const p of processes) trySignal(p.pid, signal);
+  };
+  const waitUntilGone = async (limitMs) => {
+    const deadline = Date.now() + limitMs;
+    for (;;) {
+      await wait(100);
+      const r = await find(userdir);
+      if (!r.isAvailable) return null;
+      if (r.processes.length === 0 || hasDeadlinePassed(deadline)) return r.processes;
+    }
+  };
+
+  await sendAll(first.processes, 'SIGTERM');
+  let left = await waitUntilGone(graceMs);
+  if (left && left.length > 0) {
+    await sendAll(left, 'SIGKILL');
+    left = await waitUntilGone(2000);
+  }
+  return { isTerminated: Array.isArray(left) && left.length === 0 };
+}
+
+// ---------------------------------------------------------------------------
+// Cleaning up after a language server, even when this process dies
+// ---------------------------------------------------------------------------
+
+/**
+ * Stop the server described by `config` and remove what it leaves behind:
+ * NetBeans' lock in the userdir, the userdir itself when it is temporary, and
+ * the owner lock. Nothing is removed unless the server is confirmed gone.
+ */
+async function cleanUpAfterServer(config) {
+  const { isTerminated } = await terminateServerProcesses(config, JVM_EXIT_GRACE_MS);
+  if (!isTerminated) return false;
+  removeFileQuietly(path.join(config.userdir, 'lock'));
+  if (config.isTemporaryUserdir) {
+    try {
+      fs.rmSync(config.userdir, { recursive: true, force: true });
+    } catch {
+      /* the OS cleans its temporary directory eventually */
+    }
+  }
+  if (config.ownerLockPath) releaseLockFile(config.ownerLockPath, config.lockNonce);
+  return true;
+}
+
+/**
+ * Start the watchdog of a language server just spawned: a detached node
+ * process that waits for this process to end, then runs cleanUpAfterServer.
+ * It learns of the end from its stdin reaching EOF, which the OS delivers
+ * however this process ends (normal exit, exception, signal, SIGKILL), so
+ * shutting the JVM down and deleting the userdir never delays the user.
+ * Returns null when it cannot be started; the caller then cleans up itself.
+ */
+function spawnServerWatchdog(config, onFailure) {
+  try {
+    const child = spawn(process.execPath, [__filename, '--internal-watchdog', JSON.stringify(config)], {
+      detached: true,
+      stdio: ['pipe', 'ignore', 'ignore'],
+      windowsHide: true,
+    });
+    child.on('error', (err) => {
+      vlog('the watchdog failed:', err.message);
+      onFailure();
+    });
+    child.stdin.on('error', () => {});
+    child.unref();
+    child.stdin.unref();
+    return child;
+  } catch (err) {
+    vlog('could not start the watchdog:', err.message);
+    return null;
+  }
+}
+
+function runWatchdog(config) {
+  let isDone = false;
+  const onOwnerGone = async () => {
+    if (isDone) return;
+    isDone = true;
+    try {
+      await cleanUpAfterServer(config);
+    } finally {
+      process.exit(0);
+    }
+  };
+  process.stdin.on('data', () => {});
+  process.stdin.on('end', onOwnerGone);
+  process.stdin.on('close', onOwnerGone);
+  process.stdin.on('error', onOwnerGone);
+  process.stdin.resume();
+}
+
+/** The language servers this process started, for the exit paths. */
+const startedServers = new Set();
+
+function releaseHeldFileLocks() {
+  for (const [lockPath, nonce] of heldFileLocks) releaseLockFile(lockPath, nonce);
+  heldFileLocks.clear();
+}
+
+/**
+ * Get ready to exit. File locks are released. On an abnormal exit (fatal
+ * error, signal) every server still running is sent SIGTERM; after a normal
+ * run they were already told to exit. A server whose watchdog could not be
+ * started is cleaned up here and now.
+ */
+async function prepareForExit({ isAbnormal }) {
+  releaseHeldFileLocks();
+  for (const server of startedServers) {
+    if (isAbnormal) signalOwnServer(server.proc, 'SIGTERM');
+  }
+  for (const server of startedServers) {
+    if (!server.watchdog) await cleanUpAfterServer(server.watchdogConfig);
+  }
+}
+
+/** Exit once what was written to stdout and stderr has been handed to the OS. */
+function exitAfterFlush(code) {
+  process.stdout.write('', () => process.stderr.write('', () => process.exit(code)));
+}
+
+function installExitHandlers() {
+  const signals = ['SIGINT', 'SIGTERM', 'SIGHUP'];
+  const onSignal = async (signal) => {
+    for (const s of signals) process.removeListener(s, onSignal);
+    await prepareForExit({ isAbnormal: true });
+    // Die of the same signal, so the shell sees what it would have seen.
+    process.kill(process.pid, signal);
+  };
+  for (const s of signals) process.on(s, onSignal);
+  const onFatal = async (err) => {
+    await prepareForExit({ isAbnormal: true });
+    fail(err && err.message ? err.message : String(err));
+  };
+  process.on('uncaughtException', onFatal);
+  process.on('unhandledRejection', onFatal);
 }
 
 // ---------------------------------------------------------------------------
@@ -1051,10 +1380,26 @@ class ServerSession {
   /**
    * Start nbcode, connect to it and initialize the workspace at rootDir. Each
    * of the three waits may take up to `timeoutMs`; past that, TimeoutError.
+   *
+   * The watchdog is started in the same tick as nbcode, so there is no
+   * moment in which this process could die and leave the server unwatched.
    */
-  static async start({ nbcodePath, jdkHome, userdir, rootDir, timeoutMs }) {
+  static async start({ nbcodePath, jdkHome, userdir, rootDir, timeoutMs, isTemporaryUserdir }) {
     const { proc, listening } = startServer(nbcodePath, jdkHome, userdir);
     const session = new ServerSession(proc);
+    const isPosix = process.platform !== 'win32';
+    session.watchdogConfig = {
+      pgid: isPosix ? proc.pid : null,
+      launcherPid: proc.pid,
+      userdir,
+      isTemporaryUserdir,
+      ownerLockPath: null,
+      lockNonce: null,
+    };
+    session.watchdog = spawnServerWatchdog(session.watchdogConfig, () => {
+      session.watchdog = null;
+    });
+    startedServers.add(session);
     try {
       const { port, hash } = await awaitWithTimeout(listening, timeoutMs);
       session.socket = await awaitWithTimeout(connect(port, hash), timeoutMs);
@@ -1063,7 +1408,7 @@ class ServerSession {
       await session.initialize(rootDir, timeoutMs);
       return session;
     } catch (err) {
-      proc.kill();
+      signalOwnServer(proc, 'SIGTERM');
       throw err;
     }
   }
@@ -1478,24 +1823,34 @@ async function formatFiles(files, context) {
   return exitCode;
 }
 
-/** Start a language server in a new temporary userdir, run `fn` with it, then shut it down. */
+/**
+ * Start a language server in a new temporary userdir, run `fn` with it, then
+ * ask it to exit. Waiting for the JVM to go and deleting the userdir are left
+ * to its watchdog.
+ */
 async function runWithServerSession({ opts, nbcodePath, jdkHome, rootDir }, fn) {
   const userdir = fs.mkdtempSync(path.join(os.tmpdir(), 'kiro-java-format-userdir-'));
-  let session = null;
-  try {
-    session = await ServerSession.start({ nbcodePath, jdkHome, userdir, rootDir, timeoutMs: opts.timeoutMs });
-    await fn(session);
-    await session.close();
-  } finally {
-    if (session) session.proc.kill();
-    cleanup(userdir);
-  }
+  const session = await ServerSession.start({
+    nbcodePath,
+    jdkHome,
+    userdir,
+    rootDir,
+    timeoutMs: opts.timeoutMs,
+    isTemporaryUserdir: true,
+  });
+  await fn(session);
+  await session.close();
 }
 
 // ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
 async function main() {
+  if (process.argv[2] === '--internal-watchdog') {
+    runWatchdog(JSON.parse(process.argv[3]));
+    return;
+  }
+  installExitHandlers();
   const opts = parseArgs(process.argv.slice(2));
   VERBOSE = opts.verbose;
 
@@ -1519,18 +1874,12 @@ async function main() {
   try {
     exitCode = await formatFiles(opts.files, { opts, nbcodePath, jdkHome, rootDir });
   } catch (err) {
+    await prepareForExit({ isAbnormal: true });
     fail(err && err.message ? err.message : String(err));
   }
 
-  process.exit(exitCode);
-}
-
-function cleanup(userdir) {
-  try {
-    fs.rmSync(userdir, { recursive: true, force: true });
-  } catch {
-    /* ignore */
-  }
+  await prepareForExit({ isAbnormal: false });
+  exitAfterFlush(exitCode);
 }
 
 if (require.main === module) main();
@@ -1566,4 +1915,9 @@ module.exports = {
   ServerExitedError,
   awaitWithTimeout,
   LspClient,
+  hasUserdirToken,
+  hasUserdirTokenInArgv,
+  parseProcStat,
+  findProcessesUsingUserdir,
+  terminateServerProcesses,
 };
