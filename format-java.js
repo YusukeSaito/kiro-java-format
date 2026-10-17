@@ -806,4 +806,6 @@ function cleanup(userdir) {
   }
 }
 
-main();
+if (require.main === module) main();
+
+module.exports = { applyEdits, fullRange, editsForUri, sameUri, lineStarts, detectRoot };

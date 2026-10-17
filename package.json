@@ -6,7 +6,8 @@
     "kiro-java-format": "bin/kiro-java-format"
   },
   "scripts": {
-    "install-cli": "bash install.sh"
+    "install-cli": "bash install.sh",
+    "test": "node --test test/unit/*.test.js && node --test --test-concurrency=1 test/integration/*.test.js"
   },
   "engines": {
     "node": ">=16"
