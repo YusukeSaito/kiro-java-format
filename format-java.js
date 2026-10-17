@@ -110,6 +110,7 @@ Options:
 Environment:
   KIRO_JAVA_EXT       Override path to the extension directory (the one containing nbcode/)
   KIRO_JAVA_JDKHOME   Override JDK home (same as --jdkhome)
+  KIRO_JAVA_FORMAT_CACHE  Cache directory for the language server's index (default: per-OS user cache dir)
 
 Exit codes:
   0  success (formatted, or already formatted in --check mode)

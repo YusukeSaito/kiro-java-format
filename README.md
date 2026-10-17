@@ -26,6 +26,11 @@ This tool:
 It is a single dependency-free Node script — nothing is installed globally except a
 small symlink.
 
+Each invocation starts its own language server and stops it when done. For a project
+whose index takes a while to build (10 seconds or more), the index is kept in a cache
+per project, so later runs of that project index faster (see [Cache](#cache)). Smaller
+projects index from scratch every time, which is quicker for them.
+
 ## Imports
 
 Imports are organized before formatting, the same as the editor's **Organize Imports**:
@@ -63,9 +68,12 @@ file as error-free and **skips organizing** if it is not, printing:
 imports skipped (file does not resolve): src/main/java/com/example/Foo.java
 ```
 
-Formatting still runs. This is why the first file in a run takes longer than the rest:
-it waits for the project's classpath to load. Files with real compile errors are always
-reported this way — fix the errors, or pass `--no-organize-imports`.
+Formatting still runs. The first file in a run waits for the project's classpath to
+load, so it takes longer than the rest. Once the project has been indexed, a file that
+still has errors is reported this way after about two seconds. When the index comes from
+the cache, the tool first waits for indexing to finish, so that a stale index cannot
+decide for it. Files with real compile errors are always reported this way — fix the
+errors, or pass `--no-organize-imports`.
 
 ## Requirements
 
@@ -129,9 +137,9 @@ find src -name '*.java' -print0 | xargs -0 kiro-java-format
 find src -name '*.java' -print0 | xargs -0 kiro-java-format --check
 ```
 
-> **Tip:** the first file is slow because the language server JVM has to boot and the
-> project's classpath has to load. Pass **many files in one invocation** to amortize
-> that startup cost — don't call the command once per file in a loop.
+> **Tip:** every invocation boots the language server JVM and loads the project's
+> classpath. Pass **many files in one invocation** to pay that startup cost once.
+> Running several invocations in parallel, or passing the same file twice, is safe.
 
 ### Options
 
@@ -143,7 +151,7 @@ find src -name '*.java' -print0 | xargs -0 kiro-java-format --check
 | `--use-tabs` | Indent with tabs instead of spaces. |
 | `--check` | Don't write; exit `1` if any file would change. |
 | `--no-organize-imports` | Only format; leave the import block alone. |
-| `--timeout <sec>` | Max seconds to wait for the server (default `120`). |
+| `--timeout <sec>` | Max seconds for each wait on the server: starting it, each request, and each file's wait for the project to load (default `120`). |
 | `-v`, `--verbose` | Print server / protocol diagnostics. |
 | `-h`, `--help` | Show help. |
 
@@ -153,6 +161,26 @@ find src -name '*.java' -print0 | xargs -0 kiro-java-format --check
 | --- | --- |
 | `KIRO_JAVA_EXT` | Path to the extension dir (the one containing `nbcode/`). Use this if auto-detection fails. |
 | `KIRO_JAVA_JDKHOME` | JDK home (same as `--jdkhome`). |
+| `KIRO_JAVA_FORMAT_CACHE` | Cache directory for the language server's index (see [Cache](#cache)). |
+
+## Cache
+
+The tool keeps a small record per project (project root + extension + JDK): how long its
+index took to build from scratch. A project that took 10 seconds or more also gets its
+index cached, about 100 MB per project; smaller projects never get one. The first run of
+a project always builds the index from scratch to measure it.
+
+| OS | Location |
+| --- | --- |
+| macOS | `~/Library/Caches/kiro-java-format/<hash>` |
+| Linux | `${XDG_CACHE_HOME:-~/.cache}/kiro-java-format/<hash>` |
+| Windows | `%LOCALAPPDATA%\kiro-java-format\<hash>` |
+
+`KIRO_JAVA_FORMAT_CACHE` replaces the `kiro-java-format` directory above.
+
+One invocation at a time uses a project's cached index; one that starts while another is
+still running builds a temporary index instead. To clear the cache, make sure no
+`kiro-java-format` is running, then delete the `kiro-java-format` directory.
 
 ## CI example (GitHub Actions)
 
@@ -187,7 +215,11 @@ editor produces. Real-world files with a `package` line are unaffected.
   `KIRO_JAVA_EXT` to the directory that contains `nbcode/`.
 - **"Timed out waiting for the language server"** — the JVM may be slow to start on first
   run, or a wrong JDK was picked. Re-run with `-v` and/or raise `--timeout`, and pass
-  `--jdkhome` to a JDK 17+.
+  `--jdkhome` to a JDK 17+. `--timeout` limits each wait, not the whole run: when the
+  server does not start in time the run stops; when one file's request times out, that
+  file is reported (`error: <file>: Timed out ...`), left unwritten, and the run goes on.
+- **Leftover `kiro-java-format-userdir-*` directories in your temp directory** — older
+  versions could leave them behind. They are safe to delete by hand.
 - **`kiro-java-format: command not found`** — your chosen bin dir isn't on `PATH`. The
   installer prints the directory; add it to `PATH` (e.g. `export PATH="$HOME/.local/bin:$PATH"`).
 
