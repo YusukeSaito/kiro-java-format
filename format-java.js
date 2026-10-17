@@ -893,11 +893,46 @@ async function formatOneFile(session, file, opts) {
 }
 
 /**
- * Format `files` in order with one language server and return the exit code.
- * Throws when the server cannot be started; failures of single files are
- * reported by formatOneFile.
+ * Split the file arguments so that no part holds the same file twice.
+ *
+ * A new part starts whenever a file (by real path) is already in the current
+ * one: `[A, B, A]` becomes `[[A, B], [A]]`. Each part gets its own language
+ * server, so no server ever reopens a URI it has closed. Reopening a closed
+ * URI races the server's asynchronous close the same way reopening after
+ * organize did.
  */
-async function formatFiles(files, { opts, nbcodePath, jdkHome, rootDir }) {
+function splitIntoSegments(files) {
+  const segments = [];
+  let current = [];
+  let seen = new Set();
+  for (const file of files) {
+    const key = fs.realpathSync(file);
+    if (seen.has(key)) {
+      segments.push(current);
+      current = [];
+      seen = new Set();
+    }
+    current.push(file);
+    seen.add(key);
+  }
+  if (current.length > 0) segments.push(current);
+  return segments;
+}
+
+/**
+ * Format `files` in order and return the exit code. Each segment (see
+ * splitIntoSegments) runs in its own language server. Throws when a server
+ * cannot be started; failures of single files are reported by formatOneFile.
+ */
+async function formatFiles(files, context) {
+  let exitCode = 0;
+  for (const segment of splitIntoSegments(files)) {
+    exitCode = Math.max(exitCode, await formatSegment(segment, context));
+  }
+  return exitCode;
+}
+
+async function formatSegment(files, { opts, nbcodePath, jdkHome, rootDir }) {
   const userdir = fs.mkdtempSync(path.join(os.tmpdir(), 'kiro-java-format-userdir-'));
   let session = null;
   try {
@@ -973,4 +1008,5 @@ module.exports = {
   normalizeLineEndings,
   validateEditsWithinText,
   EditsMismatchError,
+  splitIntoSegments,
 };
