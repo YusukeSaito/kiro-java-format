@@ -23,7 +23,8 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const net = require('net');
-const { spawn, execFileSync } = require('child_process');
+const crypto = require('crypto');
+const { spawn, execFile, execFileSync } = require('child_process');
 const { pathToFileURL } = require('url');
 
 // ---------------------------------------------------------------------------
@@ -138,6 +139,27 @@ const POLL_MS = 250;
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
+
+/** Pause between retries of a lock (or another poll that has no event to wait for). */
+function waitMs(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * True once `deadlineMs` is reached. A NaN deadline (from `--timeout abc`)
+ * counts as reached, so no wait loop can spin forever on it.
+ */
+function hasDeadlinePassed(deadlineMs) {
+  return !(Date.now() < deadlineMs);
+}
+
+const LOCK_RETRY_MS = 50;
+/** A lock younger than this cannot belong to a recycled pid, so the command line is not checked. */
+const LOCK_PID_CHECK_AGE_MS = 2000;
+/** A lock file that cannot be parsed is a leftover once it is this old. */
+const LOCK_UNPARSABLE_STALE_MS = 5000;
+/** A `.break` marker this old was left by a process that died while breaking a lock. */
+const LOCK_BREAK_STALE_MS = 10000;
 
 // ---------------------------------------------------------------------------
 // Locate the installed Oracle Java extension (contains nbcode/)
@@ -536,6 +558,280 @@ function sameUri(a, b) {
     }
   };
   return decode(a) === decode(b);
+}
+
+// ---------------------------------------------------------------------------
+// Cache location
+// ---------------------------------------------------------------------------
+
+/**
+ * The per-user cache directory of this tool (it holds the lock files, and the
+ * language server's index per project). KIRO_JAVA_FORMAT_CACHE overrides it.
+ */
+function resolveCacheRoot({ env, platform, homedir }) {
+  if (env.KIRO_JAVA_FORMAT_CACHE) return path.resolve(env.KIRO_JAVA_FORMAT_CACHE);
+  if (platform === 'darwin') return path.posix.join(homedir, 'Library', 'Caches', 'kiro-java-format');
+  if (platform === 'win32') {
+    const base = env.LOCALAPPDATA || path.win32.join(homedir, 'AppData', 'Local');
+    return path.win32.join(base, 'kiro-java-format');
+  }
+  const xdg = env.XDG_CACHE_HOME && path.posix.isAbsolute(env.XDG_CACHE_HOME) ? env.XDG_CACHE_HOME : null;
+  return path.posix.join(xdg || path.posix.join(homedir, '.cache'), 'kiro-java-format');
+}
+
+function resolveCurrentCacheRoot() {
+  return resolveCacheRoot({ env: process.env, platform: process.platform, homedir: os.homedir() });
+}
+
+/** Create `dir` (and its parents) readable by this user only. Throws when it cannot. */
+function ensurePrivateDir(dir) {
+  fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+  return dir;
+}
+
+// ---------------------------------------------------------------------------
+// Is a process one of ours, and alive?
+// ---------------------------------------------------------------------------
+
+/** Whether this platform has the means to look at other processes' command lines. */
+function isProcessInspectionAvailable() {
+  if (process.platform === 'linux') return fs.existsSync('/proc/self/stat');
+  if (process.platform === 'win32') return fs.existsSync(findPowerShell());
+  return fs.existsSync('/bin/ps');
+}
+
+function findPowerShell() {
+  const root = process.env.SystemRoot || 'C:\\Windows';
+  return path.win32.join(root, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe');
+}
+
+/** Run a command; resolves to { code, stdout } or rejects when it cannot be started. */
+function runCommand(file, args) {
+  return new Promise((resolve, reject) => {
+    execFile(file, args, { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024, windowsHide: true }, (err, stdout) => {
+      if (err && typeof err.code !== 'number') {
+        reject(err);
+        return;
+      }
+      resolve({ code: err ? err.code : 0, stdout });
+    });
+  });
+}
+
+/** True when a command line runs this tool (an argument named format-java.js). */
+function hasToolScriptArgument(commandLine) {
+  return /(^|[\s/\\"])format-java\.js(["\s]|$)/i.test(commandLine);
+}
+
+/**
+ * Whether `pid` is alive and, when asked, still runs this tool.
+ *
+ * Returns `{ isAvailable: false, reason }` when it cannot be told, otherwise
+ * `{ isAvailable: true, isAlive }`. The command line is checked only when
+ * `shouldVerifyCommandLine` is set: a pid in a lock older than a moment may
+ * have been recycled for an unrelated process.
+ */
+async function inspectToolProcess(pid, { shouldVerifyCommandLine }) {
+  try {
+    process.kill(pid, 0);
+  } catch (err) {
+    if (err.code === 'ESRCH' || err.code === 'EPERM') return { isAvailable: true, isAlive: false };
+    return { isAvailable: false, reason: err.message };
+  }
+  if (!shouldVerifyCommandLine) return { isAvailable: true, isAlive: true };
+  try {
+    if (process.platform === 'linux') {
+      let raw;
+      try {
+        raw = fs.readFileSync(`/proc/${pid}/cmdline`, 'utf8');
+      } catch (err) {
+        if (err.code === 'ENOENT' || err.code === 'ESRCH') return { isAvailable: true, isAlive: false };
+        return { isAvailable: false, reason: err.message };
+      }
+      const argv = raw.split('\0').filter(Boolean);
+      return { isAvailable: true, isAlive: argv.some((a) => path.basename(a) === 'format-java.js') };
+    }
+    if (process.platform === 'win32') {
+      const r = await runCommand(findPowerShell(), [
+        '-NoProfile',
+        '-NonInteractive',
+        '-Command',
+        `Get-CimInstance Win32_Process -Filter "ProcessId=${Number(pid)}" | Select-Object -ExpandProperty CommandLine`,
+      ]);
+      if (r.code !== 0) return { isAvailable: false, reason: `powershell exited ${r.code}` };
+      return { isAvailable: true, isAlive: hasToolScriptArgument(r.stdout.trim()) };
+    }
+    const r = await runCommand('ps', ['-ww', '-o', 'command=', '-p', String(pid)]);
+    if (r.code === 1 && r.stdout.trim() === '') return { isAvailable: true, isAlive: false };
+    if (r.code !== 0) return { isAvailable: false, reason: `ps exited ${r.code}` };
+    return { isAvailable: true, isAlive: hasToolScriptArgument(r.stdout.trim()) };
+  } catch (err) {
+    return { isAvailable: false, reason: err.message };
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Lock files
+// ---------------------------------------------------------------------------
+
+/**
+ * Read a lock file: `{ kind: 'missing' }`, `{ kind: 'unparsable', mtimeMs }`
+ * or `{ kind: 'parsed', record, mtimeMs }`.
+ */
+function readLockRecord(lockPath) {
+  let text;
+  let mtimeMs;
+  try {
+    mtimeMs = fs.statSync(lockPath).mtimeMs;
+    text = fs.readFileSync(lockPath, 'utf8');
+  } catch (err) {
+    if (err.code === 'ENOENT') return { kind: 'missing' };
+    throw err;
+  }
+  try {
+    const record = JSON.parse(text);
+    if (record && Number.isInteger(record.pid) && typeof record.nonce === 'string') {
+      return { kind: 'parsed', record, mtimeMs };
+    }
+  } catch {
+    /* fall through */
+  }
+  return { kind: 'unparsable', mtimeMs };
+}
+
+function writePrivateTempFile(lockPath, content) {
+  const tmp = `${lockPath}.${process.pid}-${crypto.randomBytes(4).toString('hex')}.tmp`;
+  fs.writeFileSync(tmp, content, { flag: 'wx', mode: 0o600 });
+  return tmp;
+}
+
+function removeFileQuietly(file) {
+  try {
+    fs.unlinkSync(file);
+  } catch {
+    /* already gone */
+  }
+}
+
+/**
+ * Try once to create `lockPath` holding `{ pid, nonce, createdAt, ...fields }`.
+ *
+ * The content is written to a temporary file first and hard-linked into place,
+ * so the lock appears complete or not at all. Returns
+ * `{ kind: 'acquired', nonce }`, `{ kind: 'busy' }` when another holder has it,
+ * or `{ kind: 'unusable', reason }` when no lock can be made here (no hard
+ * links on this file system, no permission, ...).
+ */
+function acquireLockFile(lockPath, fields) {
+  const nonce = crypto.randomBytes(16).toString('hex');
+  const content = JSON.stringify({ pid: process.pid, nonce, createdAt: Date.now(), ...fields });
+  let tmp;
+  try {
+    tmp = writePrivateTempFile(lockPath, content);
+  } catch (err) {
+    return { kind: 'unusable', reason: err.message };
+  }
+  try {
+    fs.linkSync(tmp, lockPath);
+    return { kind: 'acquired', nonce };
+  } catch (err) {
+    if (err.code === 'EEXIST') return { kind: 'busy' };
+    return { kind: 'unusable', reason: err.message };
+  } finally {
+    removeFileQuietly(tmp);
+  }
+}
+
+/**
+ * Whether the lock read by readLockRecord is left over and may be broken.
+ *
+ * Its holder (and, for an owner lock, the holder's watchdog) must be known to
+ * be dead. When that cannot be told, the lock is not stale: every wait on a
+ * lock has its own limit, so nothing waits forever on it.
+ */
+async function isLockStale(read, nowMs, { inspect = inspectToolProcess } = {}) {
+  if (read.kind === 'missing') return false;
+  if (read.kind === 'unparsable') return nowMs - read.mtimeMs > LOCK_UNPARSABLE_STALE_MS;
+  const { record } = read;
+  const shouldVerifyCommandLine = !(nowMs - record.createdAt < LOCK_PID_CHECK_AGE_MS);
+  const pids = [record.pid];
+  if (record.server && Number.isInteger(record.server.watchdogPid)) pids.push(record.server.watchdogPid);
+  for (const pid of pids) {
+    const r = await inspect(pid, { shouldVerifyCommandLine });
+    if (!r.isAvailable || r.isAlive) return false;
+  }
+  return true;
+}
+
+/**
+ * Remove a stale lock, unless someone replaced it since it was read.
+ *
+ * Breakers take `<lockPath>.break` first, so of two processes that both judged
+ * the same lock stale only one removes it; the other then finds a different
+ * lock (or none) and leaves it alone.
+ */
+function breakStaleLock(lockPath, read) {
+  const breakPath = `${lockPath}.break`;
+  const takeBreakMarker = () => {
+    try {
+      fs.closeSync(fs.openSync(breakPath, 'wx'));
+      return true;
+    } catch (err) {
+      if (err.code !== 'EEXIST') return false;
+    }
+    try {
+      if (Date.now() - fs.statSync(breakPath).mtimeMs <= LOCK_BREAK_STALE_MS) return false;
+      fs.unlinkSync(breakPath);
+      fs.closeSync(fs.openSync(breakPath, 'wx'));
+      return true;
+    } catch {
+      return false;
+    }
+  };
+  if (!takeBreakMarker()) return false;
+  try {
+    const now = readLockRecord(lockPath);
+    const isSameLock =
+      (read.kind === 'parsed' && now.kind === 'parsed' && now.record.nonce === read.record.nonce) ||
+      (read.kind === 'unparsable' && now.kind === 'unparsable' && now.mtimeMs === read.mtimeMs);
+    if (!isSameLock) return false;
+    fs.unlinkSync(lockPath);
+    return true;
+  } catch {
+    return false;
+  } finally {
+    removeFileQuietly(breakPath);
+  }
+}
+
+/** Remove the lock if it is still ours. */
+function releaseLockFile(lockPath, nonce) {
+  try {
+    const read = readLockRecord(lockPath);
+    if (read.kind !== 'parsed' || read.record.nonce !== nonce) return false;
+    fs.unlinkSync(lockPath);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** Merge `fields` into the lock if it is still ours (written whole, then renamed into place). */
+function updateLockFile(lockPath, nonce, fields) {
+  try {
+    const read = readLockRecord(lockPath);
+    if (read.kind !== 'parsed' || read.record.nonce !== nonce) return false;
+    const tmp = writePrivateTempFile(lockPath, JSON.stringify({ ...read.record, ...fields }));
+    try {
+      fs.renameSync(tmp, lockPath);
+    } catch (err) {
+      removeFileQuietly(tmp);
+      throw err;
+    }
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -1009,4 +1305,16 @@ module.exports = {
   validateEditsWithinText,
   EditsMismatchError,
   splitIntoSegments,
+  resolveCacheRoot,
+  ensurePrivateDir,
+  isProcessInspectionAvailable,
+  inspectToolProcess,
+  readLockRecord,
+  acquireLockFile,
+  isLockStale,
+  breakStaleLock,
+  releaseLockFile,
+  updateLockFile,
+  LOCK_PID_CHECK_AGE_MS,
+  LOCK_UNPARSABLE_STALE_MS,
 };
