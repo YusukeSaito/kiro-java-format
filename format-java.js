@@ -450,26 +450,73 @@ function fullRange(text) {
 /**
  * Collect the TextEdits a WorkspaceEdit targets at one document.
  *
- * A WorkspaceEdit can carry either shape, so both are read. Edits for other
- * documents are dropped: organizing one file's imports must not rewrite its
- * neighbours, and the caller only ever holds the one file's text.
+ * A WorkspaceEdit can carry either shape. When it carries both, LSP says
+ * `documentChanges` wins, so only that one is read; reading both would apply
+ * the same edit twice. Edits for other documents are dropped: organizing one
+ * file's imports must not rewrite its neighbours, and the caller only ever
+ * holds the one file's text.
  */
 function editsForUri(workspaceEdit, uri) {
   if (!workspaceEdit) return [];
   const out = [];
+  if (Array.isArray(workspaceEdit.documentChanges)) {
+    for (const change of workspaceEdit.documentChanges) {
+      const target = change && change.textDocument ? change.textDocument.uri : null;
+      if (target && sameUri(target, uri) && Array.isArray(change.edits)) out.push(...change.edits);
+    }
+    return out;
+  }
   const changes = workspaceEdit.changes;
   if (changes) {
     for (const key of Object.keys(changes)) {
       if (sameUri(key, uri) && Array.isArray(changes[key])) out.push(...changes[key]);
     }
   }
-  if (Array.isArray(workspaceEdit.documentChanges)) {
-    for (const change of workspaceEdit.documentChanges) {
-      const target = change && change.textDocument ? change.textDocument.uri : null;
-      if (target && sameUri(target, uri) && Array.isArray(change.edits)) out.push(...change.edits);
+  return out;
+}
+
+/**
+ * The text as the server holds it after didOpen: NBLS turns CRLF and lone CR
+ * into LF when it opens a document, but takes didChange text as it comes.
+ */
+function normalizeLineEndings(text) {
+  return text.replace(/\r\n?/g, '\n');
+}
+
+class EditsMismatchError extends Error {
+  constructor() {
+    super('the language server returned edits that do not match the file; not written');
+    this.name = 'EditsMismatchError';
+  }
+}
+
+/**
+ * Throw EditsMismatchError unless every edit lies inside `text`.
+ *
+ * A position is inside when its line exists and its character is at most that
+ * line's length (the `\n` is not counted, a `\r` is). The position just past
+ * the last line, `{ line: lineCount, character: 0 }`, is the end of the text
+ * and allowed. An edit outside the text means the server computed it against
+ * a different document than ours, and applying it would corrupt the file.
+ */
+function validateEditsWithinText(text, edits) {
+  if (!Array.isArray(edits)) return;
+  const starts = lineStarts(text);
+  const lineCount = starts.length;
+  const isInside = (pos) => {
+    if (!pos || !Number.isInteger(pos.line) || !Number.isInteger(pos.character)) return false;
+    if (pos.line < 0 || pos.character < 0) return false;
+    if (pos.line === lineCount) return pos.character === 0;
+    if (pos.line > lineCount) return false;
+    const lineEnd = pos.line + 1 < lineCount ? starts[pos.line + 1] - 1 : text.length;
+    return pos.character <= lineEnd - starts[pos.line];
+  };
+  for (const e of edits) {
+    if (!e || !e.range || !isInside(e.range.start) || !isInside(e.range.end)) {
+      vlog('edit outside the text:', JSON.stringify(e));
+      throw new EditsMismatchError();
     }
   }
-  return out;
 }
 
 /**
@@ -492,42 +539,49 @@ function sameUri(a, b) {
 }
 
 // ---------------------------------------------------------------------------
-// Main
+// One running language server and the documents open in it
 // ---------------------------------------------------------------------------
-async function main() {
-  const opts = parseArgs(process.argv.slice(2));
-  VERBOSE = opts.verbose;
 
-  if (opts.files.length === 0) {
-    printHelp();
-    process.exit(1);
+/**
+ * A running language server and what this tool knows about its documents.
+ *
+ * Every open, change and close of a document goes through this class, so the
+ * text the server holds is always known (`doc.serverText`). Formatting edits
+ * are computed against that text; applying them to any other text corrupts
+ * the file.
+ */
+class ServerSession {
+  constructor(proc, socket, client) {
+    this.proc = proc;
+    this.socket = socket;
+    this.client = client;
+    // Organizing imports rewrites the whole import block from the types the
+    // compiler can resolve. Before the project's classpath is ready nothing
+    // resolves, so the server would drop every import it cannot see. Track
+    // diagnostics and only organize once the file compiles clean.
+    this.diagnostics = new Map();
+    // Some code actions push their result instead of returning it. Keep the
+    // last pushed edit so the organize-imports step can pick it up.
+    this.pushedEdit = null;
   }
-  for (const f of opts.files) {
-    if (!fs.existsSync(f)) fail(`No such file: ${f}`);
-    if (!f.endsWith('.java')) fail(`Not a .java file: ${f}`);
+
+  /** Start nbcode, connect to it and initialize the workspace at rootDir. */
+  static async start({ nbcodePath, jdkHome, userdir, rootDir }) {
+    const server = await startServer(nbcodePath, jdkHome, userdir);
+    try {
+      const socket = await connect(server.port, server.hash);
+      const session = new ServerSession(server.proc, socket, new LspClient(socket));
+      session.registerHandlers();
+      await session.initialize(rootDir);
+      return session;
+    } catch (err) {
+      server.proc.kill();
+      throw err;
+    }
   }
 
-  const extPath = findExtension();
-  const nbcodePath = findNbcode(extPath);
-  const jdkHome = findJdkHome(opts.jdkHome);
-
-  const userdir = path.join(os.tmpdir(), `kiro-java-format-userdir-${process.pid}`);
-  fs.mkdirSync(userdir, { recursive: true });
-
-  const rootDir = detectRoot(opts.files[0], opts.root);
-  vlog('root:', rootDir);
-
-  let server;
-  const timeout = setTimeout(() => {
-    fail(`Timed out after ${opts.timeoutMs / 1000}s waiting for the language server. Try --timeout or --verbose.`);
-  }, opts.timeoutMs);
-
-  let exitCode = 0;
-  try {
-    server = await startServer(nbcodePath, jdkHome, userdir);
-    const socket = await connect(server.port, server.hash);
-    const client = new LspClient(socket);
-
+  registerHandlers() {
+    const client = this.client;
     // Reply to server-initiated requests so it never blocks waiting on us.
     client.onRequest('workspace/configuration', (params) => {
       if (process.env.KJF_DUMP) console.error('CONFIG?', JSON.stringify(params));
@@ -538,31 +592,19 @@ async function main() {
     client.onRequest('window/workDoneProgress/create', () => null);
     client.onRequest('window/showMessageRequest', () => null);
 
-    // Some code actions push their result instead of returning it. Keep the
-    // last pushed edit so the organize-imports step can pick it up; report it
-    // as applied because we do apply it, just to our own copy of the text.
-    let pushedEdit = null;
+    // Report a pushed edit as applied because we do apply it, just to our own
+    // copy of the text.
     client.onRequest('workspace/applyEdit', (params) => {
       if (params && params.edit) {
-        pushedEdit = params.edit;
+        this.pushedEdit = params.edit;
         return { applied: true };
       }
       return { applied: false };
     });
-    const takePushedEdit = () => {
-      const edit = pushedEdit;
-      pushedEdit = null;
-      return edit;
-    };
 
-    // Organizing imports rewrites the whole import block from the types the
-    // compiler can resolve. Before the project's classpath is ready nothing
-    // resolves, so the server would drop every import it cannot see. Track
-    // diagnostics and only organize once the file compiles clean.
-    const diagnostics = new Map();
     client.onNotification('textDocument/publishDiagnostics', (params) => {
       if (!params || !params.uri) return;
-      diagnostics.set(params.uri, params.diagnostics || []);
+      this.diagnostics.set(params.uri, params.diagnostics || []);
       if (process.env.KJF_DUMP) {
         const errors = (params.diagnostics || []).filter((d) => d.severity === 1);
         console.error(
@@ -571,13 +613,10 @@ async function main() {
         );
       }
     });
-    const errorsFor = (uri) => {
-      for (const [key, list] of diagnostics) {
-        if (sameUri(key, uri)) return list.filter((d) => d.severity === 1);
-      }
-      return null; // nothing published yet
-    };
+  }
 
+  async initialize(rootDir) {
+    const client = this.client;
     const rootUri = pathToFileURL(rootDir).href;
     const initResult = await client.request('initialize', {
       processId: process.pid,
@@ -632,169 +671,285 @@ async function main() {
     });
     if (process.env.KJF_DUMP) console.error('SERVER CAPS', JSON.stringify(initResult));
     client.notify('initialized', {});
+  }
 
-    /**
-     * Run the editor's "Organize Imports" on the open document.
-     *
-     * Returns the resulting text, or the input unchanged when the server has
-     * nothing to do. Formatting runs afterwards, so this only has to get the
-     * import block right — not its indentation.
-     */
-    /**
-     * Wait until the server reports the open document has no errors.
-     *
-     * This is the gate for organizing imports. The server rebuilds the import
-     * block from the types it can resolve, so running it while the classpath is
-     * still loading deletes every import it cannot see. "No errors" is the
-     * signal that resolution finished and the rebuild will keep what is used.
-     *
-     * Diagnostics can be published more than once as analysis progresses, so a
-     * clean result is awaited rather than the first result.
-     */
-    async function waitUntilResolves(uri) {
-      const deadline = Date.now() + RESOLVE_WAIT_MS;
-      for (;;) {
-        const errors = errorsFor(uri);
-        if (errors && errors.length === 0) return true;
-        if (Date.now() >= deadline) {
-          vlog(errors ? `still ${errors.length} error(s)` : 'no diagnostics received');
-          return false;
-        }
-        await sleep(POLL_MS);
-      }
+  /** The errors last published for `uri`, or null when nothing was published yet. */
+  findErrors(uri) {
+    for (const [key, list] of this.diagnostics) {
+      if (sameUri(key, uri)) return list.filter((d) => d.severity === 1);
     }
+    return null;
+  }
 
-    async function organizeImports(uri, text) {
-      let actions;
-      try {
-        actions = await client.request('textDocument/codeAction', {
-          textDocument: { uri },
-          range: fullRange(text),
-          context: { diagnostics: [], only: ['source.organizeImports'] },
-        });
-      } catch (err) {
-        // Leave the imports rather than the whole file: formatting still works.
-        vlog('textDocument/codeAction failed:', err.message);
-        return text;
+  /**
+   * Wait until the server reports the open document has no errors.
+   *
+   * This is the gate for organizing imports. The server rebuilds the import
+   * block from the types it can resolve, so running it while the classpath is
+   * still loading deletes every import it cannot see. "No errors" is the
+   * signal that resolution finished and the rebuild will keep what is used.
+   *
+   * Diagnostics can be published more than once as analysis progresses, so a
+   * clean result is awaited rather than the first result.
+   */
+  async waitUntilResolves(uri) {
+    const deadline = Date.now() + RESOLVE_WAIT_MS;
+    for (;;) {
+      const errors = this.findErrors(uri);
+      if (errors && errors.length === 0) return true;
+      if (Date.now() >= deadline) {
+        vlog(errors ? `still ${errors.length} error(s)` : 'no diagnostics received');
+        return false;
       }
-      if (process.env.KJF_DUMP) console.error('ACTIONS', JSON.stringify(actions));
-      // Only take the organize-imports action. Asking with `only` should give
-      // nothing else, but a Command (no `kind`) would be a different operation
-      // and running it blindly could change code, not imports.
-      const action = Array.isArray(actions)
-        ? actions.find((a) => a && a.kind === 'source.organizeImports')
-        : null;
-      if (!action) {
-        vlog('organize imports not offered, leaving imports as they are');
-        return text;
-      }
-
-      // The action arrives without an edit; the server computes it on resolve.
-      let resolved = action;
-      if (!resolved.edit) {
-        try {
-          resolved = await client.request('codeAction/resolve', action);
-        } catch (err) {
-          vlog('codeAction/resolve failed:', err.message);
-          return text;
-        }
-      }
-      const edit = (resolved && resolved.edit) || takePushedEdit();
-      const edits = editsForUri(edit, uri);
-      if (process.env.KJF_DUMP) console.error('IMPORT EDITS', JSON.stringify(edits));
-      if (edits.length === 0) return text;
-      return applyEdits(text, edits);
+      await sleep(POLL_MS);
     }
+  }
 
-    for (const file of opts.files) {
-      const uri = pathToFileURL(file).href;
-      const original = fs.readFileSync(file, 'utf8');
-      let current = original;
-
-      const open = (text) =>
-        client.notify('textDocument/didOpen', {
-          textDocument: { uri, languageId: 'java', version: 1, text },
-        });
-      const close = () => client.notify('textDocument/didClose', { textDocument: { uri } });
-
-      // One bad file must not abandon the rest: a run over a whole tree would
-      // then leave some files formatted and the remainder untouched, with no
-      // way to tell where it stopped.
-      try {
-        // Drop what the server said about this path earlier so the gate below
-        // reads the result for this open, not a previous run's.
-        for (const key of [...diagnostics.keys()]) {
-          if (sameUri(key, uri)) diagnostics.delete(key);
-        }
-        open(current);
-
-        if (opts.organizeImports) {
-          if (await waitUntilResolves(uri)) {
-            const organized = await organizeImports(uri, current);
-            if (organized !== current) {
-              current = organized;
-              // Reopen so the server formats what we hold. Sending the
-              // formatting request against the pre-organize document would
-              // return edits whose ranges no longer line up with our text.
-              close();
-              open(current);
-            }
-          } else {
-            // Organizing now would drop the imports of everything that does not
-            // resolve. Formatting is still safe, so carry on with it.
-            console.log(`imports skipped (file does not resolve): ${file}`);
-          }
-        }
-
-        const edits = await client.request('textDocument/formatting', {
-          textDocument: { uri },
-          options: { tabSize: opts.tabSize, insertSpaces: opts.insertSpaces },
-        });
-
-        close();
-
-        if (process.env.KJF_DUMP) console.error('EDITS', JSON.stringify(edits));
-        const result = edits && edits.length > 0 ? applyEdits(current, edits) : current;
-        if (result === original) {
-          console.log(`unchanged: ${file}`);
-          continue;
-        }
-        if (opts.check) {
-          console.log(`would reformat: ${file}`);
-          exitCode = 1;
-        } else {
-          fs.writeFileSync(file, result, 'utf8');
-          console.log(`formatted: ${file}`);
-        }
-      } catch (err) {
-        // Close so the server does not keep holding a document we abandoned.
-        try {
-          close();
-        } catch {
-          /* ignore */
-        }
-        console.error(`error: ${file}: ${err && err.message ? err.message : String(err)}`);
-        exitCode = 1;
-      }
+  /**
+   * Open `uri` with `text` and return the document.
+   *
+   * What the server said about this path earlier is dropped first, so the
+   * resolve gate reads the result for this open, not an earlier one.
+   */
+  openDocument(uri, text) {
+    for (const key of [...this.diagnostics.keys()]) {
+      if (sameUri(key, uri)) this.diagnostics.delete(key);
     }
+    const doc = { uri, version: 1, serverText: normalizeLineEndings(text), openedAtMs: Date.now() };
+    this.client.notify('textDocument/didOpen', {
+      textDocument: { uri, languageId: 'java', version: doc.version, text },
+    });
+    return doc;
+  }
 
+  /**
+   * Replace the whole content of an open document with `text` (already
+   * normalized), in place.
+   *
+   * The document stays open. Closing and reopening the URI instead races the
+   * server's asynchronous close: the server can end up holding the old text,
+   * and formatting edits computed against it land at the wrong offsets.
+   */
+  changeDocument(doc, text) {
+    doc.version += 1;
+    this.client.notify('textDocument/didChange', {
+      textDocument: { uri: doc.uri, version: doc.version },
+      contentChanges: [{ range: fullRange(doc.serverText), text }],
+    });
+    doc.serverText = text;
+  }
+
+  closeDocument(doc) {
+    this.client.notify('textDocument/didClose', { textDocument: { uri: doc.uri } });
+  }
+
+  takePushedEdit() {
+    const edit = this.pushedEdit;
+    this.pushedEdit = null;
+    return edit;
+  }
+
+  /**
+   * Run the editor's "Organize Imports" on the open document.
+   *
+   * Returns the resulting text, or the input unchanged when the server has
+   * nothing to do. Formatting runs afterwards, so this only has to get the
+   * import block right — not its indentation.
+   */
+  async organizeImports(doc, text) {
+    const client = this.client;
+    const uri = doc.uri;
+    // An edit pushed while an earlier file was organized must not be taken
+    // for this one.
+    this.pushedEdit = null;
+    let actions;
     try {
-      await client.request('shutdown', null);
-      client.notify('exit', null);
+      actions = await client.request('textDocument/codeAction', {
+        textDocument: { uri },
+        range: fullRange(text),
+        context: { diagnostics: [], only: ['source.organizeImports'] },
+      });
+    } catch (err) {
+      // Leave the imports rather than the whole file: formatting still works.
+      vlog('textDocument/codeAction failed:', err.message);
+      return text;
+    }
+    if (process.env.KJF_DUMP) console.error('ACTIONS', JSON.stringify(actions));
+    // Only take the organize-imports action. Asking with `only` should give
+    // nothing else, but a Command (no `kind`) would be a different operation
+    // and running it blindly could change code, not imports.
+    const action = Array.isArray(actions)
+      ? actions.find((a) => a && a.kind === 'source.organizeImports')
+      : null;
+    if (!action) {
+      vlog('organize imports not offered, leaving imports as they are');
+      return text;
+    }
+
+    // The action arrives without an edit; the server computes it on resolve.
+    let resolved = action;
+    if (!resolved.edit) {
+      try {
+        resolved = await client.request('codeAction/resolve', action);
+      } catch (err) {
+        vlog('codeAction/resolve failed:', err.message);
+        return text;
+      }
+    }
+    const edit = (resolved && resolved.edit) || this.takePushedEdit();
+    const edits = editsForUri(edit, uri);
+    if (process.env.KJF_DUMP) console.error('IMPORT EDITS', JSON.stringify(edits));
+    if (edits.length === 0) return text;
+    validateEditsWithinText(text, edits);
+    return applyEdits(text, edits);
+  }
+
+  formatDocument(doc, { tabSize, insertSpaces }) {
+    return this.client.request('textDocument/formatting', {
+      textDocument: { uri: doc.uri },
+      options: { tabSize, insertSpaces },
+    });
+  }
+
+  /** Ask the server to shut down and close the connection. */
+  async close() {
+    try {
+      await this.client.request('shutdown', null);
+      this.client.notify('exit', null);
     } catch {
       /* ignore */
     }
-    socket.end();
+    this.socket.end();
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Formatting files
+// ---------------------------------------------------------------------------
+
+/**
+ * Organize, format and write one file. Returns this file's exit code: 1 when
+ * it would be reformatted (--check) or failed, otherwise 0.
+ *
+ * One bad file must not abandon the rest: a run over a whole tree would then
+ * leave some files formatted and the remainder untouched, with no way to tell
+ * where it stopped. So failures are reported here and not thrown.
+ */
+async function formatOneFile(session, file, opts) {
+  const uri = pathToFileURL(file).href;
+  const original = fs.readFileSync(file, 'utf8');
+  let current = original;
+  let doc = null;
+  try {
+    doc = session.openDocument(uri, current);
+
+    if (opts.organizeImports) {
+      if (await session.waitUntilResolves(uri)) {
+        const organized = await session.organizeImports(doc, current);
+        if (organized !== current) {
+          current = organized;
+          // Hand the server what we hold, so the formatting edits line up
+          // with our text.
+          session.changeDocument(doc, normalizeLineEndings(current));
+        }
+      } else {
+        // Organizing now would drop the imports of everything that does not
+        // resolve. Formatting is still safe, so carry on with it.
+        console.log(`imports skipped (file does not resolve): ${file}`);
+      }
+    }
+
+    const edits = await session.formatDocument(doc, { tabSize: opts.tabSize, insertSpaces: opts.insertSpaces });
+
+    session.closeDocument(doc);
+    doc = null;
+
+    if (process.env.KJF_DUMP) console.error('EDITS', JSON.stringify(edits));
+    validateEditsWithinText(current, edits);
+    const result = edits && edits.length > 0 ? applyEdits(current, edits) : current;
+    if (result === original) {
+      console.log(`unchanged: ${file}`);
+      return 0;
+    }
+    if (opts.check) {
+      console.log(`would reformat: ${file}`);
+      return 1;
+    }
+    fs.writeFileSync(file, result, 'utf8');
+    console.log(`formatted: ${file}`);
+    return 0;
+  } catch (err) {
+    // Close so the server does not keep holding a document we abandoned.
+    if (doc) {
+      try {
+        session.closeDocument(doc);
+      } catch {
+        /* ignore */
+      }
+    }
+    console.error(`error: ${file}: ${err && err.message ? err.message : String(err)}`);
+    return 1;
+  }
+}
+
+/**
+ * Format `files` in order with one language server and return the exit code.
+ * Throws when the server cannot be started; failures of single files are
+ * reported by formatOneFile.
+ */
+async function formatFiles(files, { opts, nbcodePath, jdkHome, rootDir }) {
+  const userdir = fs.mkdtempSync(path.join(os.tmpdir(), 'kiro-java-format-userdir-'));
+  let session = null;
+  try {
+    session = await ServerSession.start({ nbcodePath, jdkHome, userdir, rootDir });
+    let exitCode = 0;
+    for (const file of files) {
+      exitCode = Math.max(exitCode, await formatOneFile(session, file, opts));
+    }
+    await session.close();
+    return exitCode;
+  } finally {
+    if (session) session.proc.kill();
+    cleanup(userdir);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Main
+// ---------------------------------------------------------------------------
+async function main() {
+  const opts = parseArgs(process.argv.slice(2));
+  VERBOSE = opts.verbose;
+
+  if (opts.files.length === 0) {
+    printHelp();
+    process.exit(1);
+  }
+  for (const f of opts.files) {
+    if (!fs.existsSync(f)) fail(`No such file: ${f}`);
+    if (!f.endsWith('.java')) fail(`Not a .java file: ${f}`);
+  }
+
+  const extPath = findExtension();
+  const nbcodePath = findNbcode(extPath);
+  const jdkHome = findJdkHome(opts.jdkHome);
+
+  const rootDir = detectRoot(opts.files[0], opts.root);
+  vlog('root:', rootDir);
+
+  const timeout = setTimeout(() => {
+    fail(`Timed out after ${opts.timeoutMs / 1000}s waiting for the language server. Try --timeout or --verbose.`);
+  }, opts.timeoutMs);
+
+  let exitCode = 0;
+  try {
+    exitCode = await formatFiles(opts.files, { opts, nbcodePath, jdkHome, rootDir });
   } catch (err) {
     clearTimeout(timeout);
-    if (server && server.proc) server.proc.kill();
-    cleanup(userdir);
     fail(err && err.message ? err.message : String(err));
   }
 
   clearTimeout(timeout);
-  if (server && server.proc) server.proc.kill();
-  cleanup(userdir);
   process.exit(exitCode);
 }
 
@@ -808,4 +963,14 @@ function cleanup(userdir) {
 
 if (require.main === module) main();
 
-module.exports = { applyEdits, fullRange, editsForUri, sameUri, lineStarts, detectRoot };
+module.exports = {
+  applyEdits,
+  fullRange,
+  editsForUri,
+  sameUri,
+  lineStarts,
+  detectRoot,
+  normalizeLineEndings,
+  validateEditsWithinText,
+  EditsMismatchError,
+};
