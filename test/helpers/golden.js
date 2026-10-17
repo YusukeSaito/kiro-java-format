@@ -163,7 +163,9 @@ function describeMismatch(expected, actual, limit = 20) {
   const b = actual.split('\n');
   const out = [];
   for (let i = 0; i < Math.max(a.length, b.length) && out.length < limit; i++) {
-    if (a[i] !== b[i]) out.push(`  line ${i + 1}:\n    expected: ${JSON.stringify(a[i])}\n    actual:   ${JSON.stringify(b[i])}`);
+    if (a[i] !== b[i]) {
+      out.push(`  line ${i + 1}:\n    expected: ${JSON.stringify(a[i])}\n    actual:   ${JSON.stringify(b[i])}`);
+    }
   }
   return out.join('\n');
 }

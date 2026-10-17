@@ -96,7 +96,10 @@ test('rejectAll passes the exit code on', async () => {
     const lsp = new LspClient(client, { onClose: () => {} });
     const pending = lsp.request('x', {});
     lsp.rejectAll(new ServerExitedError(7));
-    await assert.rejects(pending, (err) => err instanceof ServerExitedError && err.message === 'language server exited (code 7)');
+    await assert.rejects(
+      pending,
+      (err) => err instanceof ServerExitedError && err.message === 'language server exited (code 7)'
+    );
   } finally {
     client.destroy();
     peer.destroy();

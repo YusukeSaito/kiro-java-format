@@ -21,7 +21,8 @@ const X = 'a/src/main/java/a/X.java';
 const Y = 'b/src/main/java/b/Y.java';
 const B_IN_M2 = path.join(os.homedir(), '.m2', 'repository', 'kjf', 'test', 'kjf-b');
 const skip =
-  shouldSkipIntegration() || (fs.existsSync(B_IN_M2) ? 'kjf.test:kjf-b is in ~/.m2, so b would resolve from the jar' : false);
+  shouldSkipIntegration() ||
+  (fs.existsSync(B_IN_M2) ? 'kjf.test:kjf-b is in ~/.m2, so b would resolve from the jar' : false);
 const script = resolveTestScript();
 
 function compare(label, expected, r, copy) {

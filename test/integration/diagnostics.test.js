@@ -43,7 +43,9 @@ function compareWithGolden(label, expected, r, copy, { isVerbose = false } = {})
   const problems = [];
   const stdout = normalizeOutput(r.stdout, [copy]);
   if (stdout !== expected.stdout) problems.push(`${label}: stdout differs\n${describeMismatch(expected.stdout, stdout)}`);
-  if (!isVerbose && normalizeOutput(r.stderr, [copy]) !== expected.stderr) problems.push(`${label}: stderr differs\n${r.stderr}`);
+  if (!isVerbose && normalizeOutput(r.stderr, [copy]) !== expected.stderr) {
+    problems.push(`${label}: stderr differs\n${r.stderr}`);
+  }
   if (r.code !== expected.code) problems.push(`${label}: exit ${r.code}, expected ${expected.code}`);
   for (const [rel, want] of expected.contents) {
     const got = fs.readFileSync(path.join(copy, rel), 'utf8');
@@ -170,7 +172,8 @@ describe('diagnostics', { skip }, () => {
       t.diagnostic(`second run ${second.elapsedMs}ms\n${normalizeOutput(timeline, [copy])}`);
       assert.match(second.stderr, /userdir \(cached\):/, 'the second run reused the cached userdir');
       assert.match(second.stderr, /waited \d+ms for the previous server/);
-      assert.deepStrictEqual(compareWithGolden('cached B', expectedForCall(golden, [B]), second, copy, { isVerbose: true }), []);
+      const expected = expectedForCall(golden, [B]);
+      assert.deepStrictEqual(compareWithGolden('cached B', expected, second, copy, { isVerbose: true }), []);
       const requested = timeline.search(/requested fresh diagnostics for \S*B\.java/);
       assert.ok(requested >= 0, `no fresh diagnostics were requested:\n${timeline}`);
       assert.match(timeline.slice(requested), /diagnostics \S*B\.java: \d+ error/, 'diagnostics arrived after the request');
@@ -220,12 +223,18 @@ describe('diagnostics', { skip }, () => {
       const results = await Promise.all(
         FILES.map((f) => runCli(script, [path.join(par, f)], { cwd: par, env: env.buildEnv() }).then((x) => [f, x]))
       );
-      for (const [f, x] of results) problems.push(...compareWithGolden(`parallel ${f}`, expectedForCall(golden, [f]), x, par));
+      for (const [f, x] of results) {
+        problems.push(...compareWithGolden(`parallel ${f}`, expectedForCall(golden, [f]), x, par));
+      }
 
       const check = copyFixture('minimal-maven', path.join(env.dir, 'check'));
-      const c = await runCli(script, ['--check', ...FILES.map((f) => path.join(check, f))], { cwd: check, env: env.buildEnv() });
+      const c = await runCli(script, ['--check', ...FILES.map((f) => path.join(check, f))], {
+        cwd: check,
+        env: env.buildEnv(),
+      });
       problems.push(...compareWithGolden('--check', expectedForCall(goldenCheck, FILES), c, check));
-      t.diagnostic(`batch ${r.elapsedMs}ms, parallel ${results.map(([, x]) => x.elapsedMs).join('/')}ms, --check ${c.elapsedMs}ms`);
+      const parallelMs = results.map(([, x]) => x.elapsedMs).join('/');
+      t.diagnostic(`batch ${r.elapsedMs}ms, parallel ${parallelMs}ms, --check ${c.elapsedMs}ms`);
     } finally {
       await finishEnv(env);
     }

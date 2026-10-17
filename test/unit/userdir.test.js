@@ -211,7 +211,13 @@ test('a lock whose owner and watchdog are both dead is broken and the userdir ta
   const env = createIsolatedEnv();
   t.after(() => env.cleanup());
   const dead = await exitedPid();
-  writeOwnerLock(env, 'k1', { pid: dead, nonce: 'n', createdAt: Date.now() - 5000, state: 'running', server: { watchdogPid: dead } });
+  writeOwnerLock(env, 'k1', {
+    pid: dead,
+    nonce: 'n',
+    createdAt: Date.now() - 5000,
+    state: 'running',
+    server: { watchdogPid: dead },
+  });
   const lease = await withCache(t, env, () => lib.acquireUserdir('k1', 5000));
   assert.strictEqual(lease.kind, 'persistent');
   assert.notStrictEqual(lib.readLockRecord(lease.ownerLock.path).record.nonce, 'n');
@@ -281,7 +287,9 @@ test('prepareUserdirForStart looks at processes only when a previous run left a 
   }
 });
 
-test('prepareUserdirForStart stops a leftover server on the userdir and spares the decoys', { skip: process.platform === 'win32' }, async (t) => {
+const isWindows = process.platform === 'win32';
+
+test('prepareUserdirForStart stops a leftover server and spares the decoys', { skip: isWindows }, async (t) => {
   const env = createIsolatedEnv();
   const userdir = path.join(env.dir, 'userdir');
   fs.mkdirSync(userdir);

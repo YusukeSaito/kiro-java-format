@@ -51,7 +51,10 @@ test('errors that arrived after completion and stay for the settle time do not r
   const indexPhase = completeAt(4000);
   assert.deepStrictEqual(decide({ entry, indexPhase, nowMs: 5000 }), pendingUntil(5000 + SETTLE));
   assert.deepStrictEqual(decide({ entry, indexPhase, nowMs: 6999 }), pendingUntil(5000 + SETTLE));
-  assert.deepStrictEqual(decide({ entry, indexPhase, nowMs: 7000 }), { kind: 'unresolved', reason: 'errors after indexing' });
+  assert.deepStrictEqual(decide({ entry, indexPhase, nowMs: 7000 }), {
+    kind: 'unresolved',
+    reason: 'errors after indexing',
+  });
 });
 
 test('errors that arrived before completion only stay pending, however long after completion', () => {
@@ -98,7 +101,9 @@ test('with a cached index, no errors before indexing completes is still pending'
 test('with a cached index, a document opened after the latest completion decides at once', () => {
   const indexPhase = completeAt(500, 1);
   const base = { isPersistentUserdir: true, indexPhase, completionCountAtOpen: 1 };
-  assert.deepStrictEqual(decide({ ...base, entry: { errorCount: 0, arrivedAtMs: 1500 }, nowMs: 1500 }), { kind: 'resolved' });
+  assert.deepStrictEqual(decide({ ...base, entry: { errorCount: 0, arrivedAtMs: 1500 }, nowMs: 1500 }), {
+    kind: 'resolved',
+  });
   assert.deepStrictEqual(decide({ ...base, entry: { errorCount: 1, arrivedAtMs: 1500 }, nowMs: 3500 }), {
     kind: 'unresolved',
     reason: 'errors after indexing',

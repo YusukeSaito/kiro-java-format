@@ -44,5 +44,8 @@ test('Linux uses an absolute XDG_CACHE_HOME, else ~/.cache', () => {
     resolveCacheRoot({ env: { XDG_CACHE_HOME: 'relative/cache' }, platform: 'linux', homedir: '/home/u' }),
     '/home/u/.cache/kiro-java-format'
   );
-  assert.strictEqual(resolveCacheRoot({ env: {}, platform: 'linux', homedir: '/home/u' }), '/home/u/.cache/kiro-java-format');
+  assert.strictEqual(
+    resolveCacheRoot({ env: {}, platform: 'linux', homedir: '/home/u' }),
+    '/home/u/.cache/kiro-java-format'
+  );
 });

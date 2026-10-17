@@ -54,7 +54,9 @@ function compare(label, expected, r, copy) {
   const problems = [];
   const stdout = normalizeOutput(r.stdout, [copy]);
   if (stdout !== expected.stdout) problems.push(`${label}: stdout differs\n${describeMismatch(expected.stdout, stdout)}`);
-  if (normalizeOutput(r.stderr, [copy]) !== expected.stderr) problems.push(`${label}: stderr differs\n${r.stderr.slice(0, 2000)}`);
+  if (normalizeOutput(r.stderr, [copy]) !== expected.stderr) {
+    problems.push(`${label}: stderr differs\n${r.stderr.slice(0, 2000)}`);
+  }
   if (r.code !== expected.code) problems.push(`${label}: exit ${r.code}, expected ${expected.code}`);
   for (const [rel, want] of expected.contents) {
     const got = fs.readFileSync(path.join(copy, rel), 'utf8');
@@ -83,27 +85,27 @@ describe('real project', { skip }, () => {
     const times = [];
     try {
       const batch = copyBase(path.join(env.dir, 'batch'));
-      const r = await runCli(script, files.map((f) => path.join(batch, f)), { cwd: batch, env: env.buildEnv(), timeoutMs: RUN_TIMEOUT_MS });
+      const runIn = (dir, rels, flags = []) =>
+        runCli(script, [...flags, ...rels.map((f) => path.join(dir, f))], {
+          cwd: dir,
+          env: env.buildEnv(),
+          timeoutMs: RUN_TIMEOUT_MS,
+        });
+      const r = await runIn(batch, files);
       times.push(`batch ${r.elapsedMs}`);
       assert.ok(!/Timed out/.test(r.stderr), 'the 20-file call does not time out');
       problems.push(...compare('batch', expectedForCall(golden, files), r, batch));
 
       const par = copyBase(path.join(env.dir, 'parallel'));
       const groups = [0, 1, 2, 3].map((g) => files.slice(g * 5, g * 5 + 5));
-      const results = await Promise.all(
-        groups.map((g) => runCli(script, g.map((f) => path.join(par, f)), { cwd: par, env: env.buildEnv(), timeoutMs: RUN_TIMEOUT_MS }))
-      );
+      const results = await Promise.all(groups.map((g) => runIn(par, g)));
       results.forEach((x, i) => {
         times.push(`parallel[${i}] ${x.elapsedMs}`);
         problems.push(...compare(`parallel ${i}`, expectedForCall(golden, groups[i]), x, par));
       });
 
       const overlap = copyBase(path.join(env.dir, 'overlap'));
-      const both = await Promise.all(
-        [files, [...files].reverse()].map((order) =>
-          runCli(script, order.map((f) => path.join(overlap, f)), { cwd: overlap, env: env.buildEnv(), timeoutMs: RUN_TIMEOUT_MS })
-        )
-      );
+      const both = await Promise.all([files, [...files].reverse()].map((order) => runIn(overlap, order)));
       both.forEach((x, i) => {
         times.push(`overlap[${i}] ${x.elapsedMs}`);
         if (x.code !== 0) problems.push(`overlap ${i}: exit ${x.code}`);
@@ -121,11 +123,7 @@ describe('real project', { skip }, () => {
       }
 
       const check = copyBase(path.join(env.dir, 'check'));
-      const c = await runCli(script, ['--check', ...files.map((f) => path.join(check, f))], {
-        cwd: check,
-        env: env.buildEnv(),
-        timeoutMs: RUN_TIMEOUT_MS,
-      });
+      const c = await runIn(check, files, ['--check']);
       times.push(`check ${c.elapsedMs}`);
       problems.push(...compare('--check', deriveCheckExpectation(BASE, files), c, check));
       t.diagnostic(`times (ms): ${times.join(', ')}`);

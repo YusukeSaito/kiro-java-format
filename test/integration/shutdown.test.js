@@ -11,7 +11,13 @@ const { shouldSkipIntegration } = require('../helpers/integration');
 const { createIsolatedEnv, listLeftovers, NO_LEFTOVERS } = require('../helpers/env');
 const { copyFixture } = require('../helpers/fixtures');
 const { resolveTestScript, startCli } = require('../helpers/cli');
-const { listProcessesWithToken, waitForNoProcessesWithToken, killOwnPids, spawnDecoy, isAlive } = require('../helpers/processes');
+const {
+  listProcessesWithToken,
+  waitForNoProcessesWithToken,
+  killOwnPids,
+  spawnDecoy,
+  isAlive,
+} = require('../helpers/processes');
 
 const FILES = ['Alpha.java', 'Beta.java', 'Gamma.java', 'Delta.java', 'Epsilon.java', 'Zeta.java'];
 // JVM_EXIT_GRACE_MS + 2 s

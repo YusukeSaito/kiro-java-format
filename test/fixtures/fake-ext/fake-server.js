@@ -89,15 +89,16 @@ function handle(socket, msg) {
       return;
     case 'initialized':
       if (env.FAKE_NO_INDEXING_MESSAGE !== '1') {
-        setTimeout(() => send(socket, { method: 'window/showMessage', params: { type: 3, message: 'Indexing completed.' } }), 20);
+        const params = { type: 3, message: 'Indexing completed.' };
+        setTimeout(() => send(socket, { method: 'window/showMessage', params }), 20);
       }
       return;
     case 'textDocument/didOpen':
     case 'textDocument/didChange':
-      setTimeout(
-        () => send(socket, { method: 'textDocument/publishDiagnostics', params: { uri: msg.params.textDocument.uri, diagnostics: [] } }),
-        30
-      );
+      setTimeout(() => {
+        const params = { uri: msg.params.textDocument.uri, diagnostics: [] };
+        send(socket, { method: 'textDocument/publishDiagnostics', params });
+      }, 30);
       return;
     case 'shutdown':
       send(socket, { id: msg.id, result: null });
@@ -106,7 +107,10 @@ function handle(socket, msg) {
       exit(0);
       return;
     default:
-      if (isRequest) send(socket, { id: msg.id, result: msg.method === 'textDocument/formatting' ? [] : msg.method === 'textDocument/codeAction' ? [] : null });
+      if (isRequest) {
+        const isList = msg.method === 'textDocument/formatting' || msg.method === 'textDocument/codeAction';
+        send(socket, { id: msg.id, result: isList ? [] : null });
+      }
   }
 }
 

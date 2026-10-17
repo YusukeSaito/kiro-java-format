@@ -90,7 +90,10 @@ test('writeFileIfUnchanged keeps hard links sharing the content', () => {
   }
 });
 
-test('writeFileIfUnchanged writes a writable file in a read-only directory', { skip: process.getuid && process.getuid() === 0 ? 'root ignores the mode' : false }, () => {
+const skipIfRoot = process.getuid && process.getuid() === 0 ? 'root ignores the mode' : false;
+const skipWithoutXattr = fs.existsSync('/usr/bin/xattr') ? false : 'no /usr/bin/xattr';
+
+test('writeFileIfUnchanged writes a writable file in a read-only directory', { skip: skipIfRoot }, () => {
   const env = createIsolatedEnv();
   const dir = path.join(env.dir, 'ro');
   try {
@@ -106,7 +109,7 @@ test('writeFileIfUnchanged writes a writable file in a read-only directory', { s
   }
 });
 
-test('writeFileIfUnchanged keeps extended attributes', { skip: fs.existsSync('/usr/bin/xattr') ? false : 'no /usr/bin/xattr' }, () => {
+test('writeFileIfUnchanged keeps extended attributes', { skip: skipWithoutXattr }, () => {
   const env = createIsolatedEnv();
   try {
     const file = path.join(env.dir, 'A.java');

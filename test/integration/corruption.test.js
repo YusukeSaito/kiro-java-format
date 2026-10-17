@@ -58,7 +58,9 @@ function compareOutput(label, expected, result, copy) {
   const stderr = normalizeOutput(result.stderr, [copy]);
   if (stdout !== expected.stdout) problems.push(`${label}: stdout differs\n${describeMismatch(expected.stdout, stdout)}`);
   if (stderr !== expected.stderr) problems.push(`${label}: stderr differs\n${describeMismatch(expected.stderr, stderr)}`);
-  if (result.code !== expected.code) problems.push(`${label}: exit ${result.code} (signal ${result.signal}), expected ${expected.code}`);
+  if (result.code !== expected.code) {
+    problems.push(`${label}: exit ${result.code} (signal ${result.signal}), expected ${expected.code}`);
+  }
   return problems;
 }
 
@@ -183,7 +185,11 @@ describe('corruption', { skip }, () => {
         const orders = [FILES, [...FILES].reverse()];
         const results = await Promise.all(
           orders.map((files) =>
-            runCli(script, files.map((f) => path.join(copy, f)), { cwd: copy, env: env.buildEnv(), timeoutMs: RUN_TIMEOUT_MS })
+            runCli(script, files.map((f) => path.join(copy, f)), {
+              cwd: copy,
+              env: env.buildEnv(),
+              timeoutMs: RUN_TIMEOUT_MS,
+            })
           )
         );
         results.forEach((r, i) => {

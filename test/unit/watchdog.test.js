@@ -113,5 +113,6 @@ test('a large project: after a normal run the watchdog releases the cached userd
   assert.deepStrictEqual(await waitForNoProcessesWithToken(env.dir, SETTLE_MS), []);
   assert.deepStrictEqual(listLeftovers(env), NO_LEFTOVERS);
   assert.strictEqual(listCachedUserdirs(env).length, 1);
-  assert.deepStrictEqual(listProjectRecords(env)[0].record.coldIndexing, { kind: 'complete', durationMs: 60000 }, 'a cached run does not record');
+  const { coldIndexing } = listProjectRecords(env)[0].record;
+  assert.deepStrictEqual(coldIndexing, { kind: 'complete', durationMs: 60000 }, 'a cached run does not record');
 });

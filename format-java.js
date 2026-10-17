@@ -1449,7 +1449,10 @@ function saveColdIndexingRecord(key, { root, extPath, jdkHome }, observation) {
     const dir = ensurePrivateDir(path.join(resolveCurrentCacheRoot(), key));
     const previous = readProjectRecord(dir);
     const coldIndexing = resolveColdIndexingRecord(previous ? previous.coldIndexing : null, observation);
-    vlog(`project record: indexing ${JSON.stringify(observation)} on a fresh index; keeping ${JSON.stringify(coldIndexing)}`);
+    vlog(
+      `project record: indexing ${JSON.stringify(observation)} on a fresh index;`,
+      `keeping ${JSON.stringify(coldIndexing)}`
+    );
     const record = {
       root,
       extPath,
@@ -1644,7 +1647,9 @@ function decideResolution({
 
   // At the limit, the latest result decides. (A NaN limit counts as reached.)
   if (!(nowMs < capAtMs)) {
-    return entry !== null && entry.errorCount === 0 ? { kind: 'resolved' } : { kind: 'unresolved', reason: 'wait limit' };
+    return entry !== null && entry.errorCount === 0
+      ? { kind: 'resolved' }
+      : { kind: 'unresolved', reason: 'wait limit' };
   }
 
   // With a cached index, a result computed before indexing completes may come
@@ -2039,7 +2044,10 @@ class ServerSession {
         stop();
         const reason = decision.kind === 'resolved' ? 'resolves' : decision.reason;
         vlog(`+${this.measureElapsedMs()}ms ${doc.uri}: ${reason} after ${nowMs - doc.openedAtMs}ms`);
-        resolve({ isResolved: decision.kind === 'resolved', reason: decision.kind === 'resolved' ? null : decision.reason });
+        resolve({
+          isResolved: decision.kind === 'resolved',
+          reason: decision.kind === 'resolved' ? null : decision.reason,
+        });
       };
       const onDiagnostics = (uri) => {
         if (sameUri(uri, doc.uri)) evaluate();
@@ -2355,7 +2363,8 @@ async function formatFiles(files, context) {
       const segment = segments[i];
       // Only the first segment can use the cached index: the others exist to
       // give a repeated file a fresh server (see splitIntoSegments).
-      const lease = i === 0 && isCacheAllowed ? await acquireUserdir(projectKey, opts.timeoutMs) : createTemporaryUserdir();
+      const lease =
+        i === 0 && isCacheAllowed ? await acquireUserdir(projectKey, opts.timeoutMs) : createTemporaryUserdir();
       let indexing = null;
       await runWithServerSession(context, lease, async (session) => {
         for (const file of segment) {
