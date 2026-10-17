@@ -4,7 +4,13 @@ const test = require('node:test');
 const assert = require('node:assert');
 const fs = require('fs');
 const path = require('path');
-const { createIsolatedEnv, listLeftovers, NO_LEFTOVERS } = require('../helpers/env');
+const {
+  createIsolatedEnv,
+  listLeftovers,
+  NO_LEFTOVERS,
+  listProjectRecords,
+  markRecordedProjectsLarge,
+} = require('../helpers/env');
 const { resolveTestScript, startCli } = require('../helpers/cli');
 const { buildFakeEnv, writeJavaFiles } = require('../helpers/fake');
 const { listProcessesWithToken, waitForNoProcessesWithToken, killOwnPids } = require('../helpers/processes');
@@ -27,13 +33,22 @@ function listCachedUserdirs(env) {
   return fs.readdirSync(cache).filter((n) => fs.existsSync(path.join(cache, n, 'userdir')));
 }
 
-async function killMidRun(t, extraEnv) {
+/** One normal run (it records the project), then the record is made to say the index is large. */
+async function recordAsLarge(env, files) {
+  const r = await startCli(script, files, { cwd: env.dir, env: buildFakeEnv(env) }).done;
+  assert.strictEqual(r.code, 0, r.stderr);
+  assert.deepStrictEqual(await waitForNoProcessesWithToken(env.dir, SETTLE_MS), []);
+  markRecordedProjectsLarge(env);
+}
+
+async function killMidRun(t, extraEnv, { isLarge = false } = {}) {
   const env = createIsolatedEnv();
   t.after(() => {
     killOwnPids(listProcessesWithToken(env.dir).map((p) => p.pid));
     env.cleanup();
   });
   const files = writeJavaFiles(env.dir, 1);
+  if (isLarge) await recordAsLarge(env, files);
   const run = startCli(script, files, {
     cwd: env.dir,
     env: { ...buildFakeEnv(env, { FAKE_NO_REPLY: 'textDocument/formatting:1' }), ...extraEnv(env) },
@@ -49,7 +64,7 @@ async function killMidRun(t, extraEnv) {
 }
 
 test('after SIGKILL of the CLI, the watchdog stops the server and releases the cached userdir', async (t) => {
-  const { env, during } = await killMidRun(t, () => ({}));
+  const { env, during } = await killMidRun(t, () => ({}), { isLarge: true });
   assert.strictEqual(during.ownerLocks.length, 1, 'the run owned the cached userdir');
   assert.strictEqual(during.netbeansLocks.length, 1, 'the server held its lock');
   assert.deepStrictEqual(listLeftovers(env), { ...NO_LEFTOVERS, fileLocks: during.fileLocks });
@@ -57,25 +72,46 @@ test('after SIGKILL of the CLI, the watchdog stops the server and releases the c
 });
 
 test('after SIGKILL of the CLI, the watchdog removes a temporary userdir', async (t) => {
-  // A cache path below a regular file cannot be created: the run falls back to a temporary userdir.
-  const { env, during } = await killMidRun(t, (e) => {
-    fs.writeFileSync(path.join(e.dir, 'not-a-dir'), '');
-    return { KIRO_JAVA_FORMAT_CACHE: path.join(e.dir, 'not-a-dir', 'cache') };
-  });
+  const { env, during } = await killMidRun(t, () => ({}));
   assert.strictEqual(during.temporaryUserdirs.length, 1);
   assert.deepStrictEqual(listLeftovers(env).temporaryUserdirs, []);
+  assert.deepStrictEqual(listCachedUserdirs(env), []);
 });
 
-test('after a normal run the watchdog releases the cached userdir once the server is gone', async (t) => {
+test('a small project runs in a temporary userdir, is recorded, and leaves no cached userdir', async (t) => {
   const env = createIsolatedEnv();
   t.after(() => {
     killOwnPids(listProcessesWithToken(env.dir).map((p) => p.pid));
     env.cleanup();
   });
   const files = writeJavaFiles(env.dir, 2);
-  const r = await startCli(script, files, { cwd: env.dir, env: buildFakeEnv(env) }).done;
+  for (const round of [1, 2]) {
+    const r = await startCli(script, ['-v', ...files], { cwd: env.dir, env: buildFakeEnv(env) }).done;
+    assert.strictEqual(r.code, 0, r.stderr);
+    assert.match(r.stderr, round === 1 ? /indexing time not measured yet/ : /the index is small/);
+    assert.deepStrictEqual(await waitForNoProcessesWithToken(env.dir, SETTLE_MS), []);
+    assert.deepStrictEqual(listLeftovers(env), NO_LEFTOVERS);
+    assert.deepStrictEqual(listCachedUserdirs(env), []);
+    const records = listProjectRecords(env);
+    assert.strictEqual(records.length, 1);
+    assert.strictEqual(records[0].record.coldIndexing.kind, 'complete');
+    assert.ok(records[0].record.coldIndexing.durationMs < 10000);
+  }
+});
+
+test('a large project: after a normal run the watchdog releases the cached userdir once the server is gone', async (t) => {
+  const env = createIsolatedEnv();
+  t.after(() => {
+    killOwnPids(listProcessesWithToken(env.dir).map((p) => p.pid));
+    env.cleanup();
+  });
+  const files = writeJavaFiles(env.dir, 2);
+  await recordAsLarge(env, files);
+  const r = await startCli(script, ['-v', ...files], { cwd: env.dir, env: buildFakeEnv(env) }).done;
   assert.strictEqual(r.code, 0, r.stderr);
+  assert.match(r.stderr, /userdir \(cached\):/);
   assert.deepStrictEqual(await waitForNoProcessesWithToken(env.dir, SETTLE_MS), []);
   assert.deepStrictEqual(listLeftovers(env), NO_LEFTOVERS);
   assert.strictEqual(listCachedUserdirs(env).length, 1);
+  assert.deepStrictEqual(listProjectRecords(env)[0].record.coldIndexing, { kind: 'complete', durationMs: 60000 }, 'a cached run does not record');
 });

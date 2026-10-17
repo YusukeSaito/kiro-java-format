@@ -2,7 +2,8 @@
 
 // A call over files of two sibling projects must not leave the cached index of
 // the first project knowing the second one: the next call over the first
-// project alone has to match a fresh server.
+// project alone has to match a fresh server. Also: the first call of a project
+// measures it in a temporary userdir; only a large one gets a cached index.
 
 const { describe, it } = require('node:test');
 const assert = require('node:assert');
@@ -10,7 +11,7 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const { shouldSkipIntegration } = require('../helpers/integration');
-const { createIsolatedEnv } = require('../helpers/env');
+const { createIsolatedEnv, markRecordedProjectsLarge } = require('../helpers/env');
 const { FIXTURES, copyFixture, hashTree } = require('../helpers/fixtures');
 const { resolveTestScript, runCli, normalizeOutput } = require('../helpers/cli');
 const { buildGolden, expectedForCall, describeMismatch } = require('../helpers/golden');
@@ -49,22 +50,28 @@ describe('userdir', { skip }, () => {
     });
     const env = createIsolatedEnv();
     const problems = [];
+    const times = [];
+    // The cache is keyed by the project's path, so every call works on the
+    // same copy, refilled from the fixture.
+    const copy = path.join(env.dir, 'project');
+    const run = async (label, rels, expectedLog) => {
+      fs.rmSync(copy, { recursive: true, force: true });
+      copyFixture('cross-project', copy);
+      const r = await runCli(script, ['-v', ...rels.map((f) => path.join(copy, f))], { cwd: copy, env: env.buildEnv() });
+      assert.match(r.stderr, expectedLog, label);
+      problems.push(...compare(label, expectedForCall(golden, rels), { ...r, stderr: '' }, copy));
+      times.push(`${label} ${r.elapsedMs}ms`);
+    };
     try {
-      const first = copyFixture('cross-project', path.join(env.dir, 'first'));
-      const r1 = await runCli(script, ['-v', ...[X, Y].map((f) => path.join(first, f))], { cwd: first, env: env.buildEnv() });
-      assert.match(r1.stderr, /more than one project root; using a temporary userdir/);
-      problems.push(...compare('[a/X, b/Y]', expectedForCall(golden, [X, Y]), { ...r1, stderr: '' }, first));
-
-      const second = copyFixture('cross-project', path.join(env.dir, 'second'));
-      const r2 = await runCli(script, ['-v', path.join(second, X)], { cwd: second, env: env.buildEnv() });
-      assert.match(r2.stderr, /userdir \(cached\):/, 'the second call uses the cached userdir');
-      problems.push(...compare('[a/X]', expectedForCall(golden, [X]), { ...r2, stderr: '' }, second));
-
-      // And the cached userdir, now warm, still gives the same result.
-      const third = copyFixture('cross-project', path.join(env.dir, 'third'));
-      const r3 = await runCli(script, [path.join(third, X)], { cwd: third, env: env.buildEnv() });
-      problems.push(...compare('[a/X] warm', expectedForCall(golden, [X]), r3, third));
-      t.diagnostic(`${r1.elapsedMs}ms, ${r2.elapsedMs}ms, ${r3.elapsedMs}ms`);
+      // a indexes fast: the first call measures it in a temporary userdir.
+      await run('[a/X] first', [X], /indexing time not measured yet; using a temporary one/);
+      // Make a look large, so it uses a cached index from now on.
+      markRecordedProjectsLarge(env);
+      await run('[a/X] cached, cold', [X], /userdir \(cached\):/);
+      // A call over both projects must not use (and so cannot teach b to) a's cached index.
+      await run('[a/X, b/Y]', [X, Y], /more than one project root; using a temporary userdir/);
+      await run('[a/X] cached, warm', [X], /userdir \(cached\):/);
+      t.diagnostic(times.join(', '));
     } finally {
       const left = await waitForNoProcessesWithToken(env.dir, 15000);
       killOwnPids(left.map((p) => p.pid));

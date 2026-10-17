@@ -1383,6 +1383,92 @@ function createTemporaryUserdir() {
   return { kind: 'temporary', userdir: fs.mkdtempSync(path.join(os.tmpdir(), 'kiro-java-format-userdir-')) };
 }
 
+/**
+ * A project whose index takes at least this long to build from scratch uses
+ * the cached index. Below it the cache saves nothing: building a small index
+ * is fast, and a cached index costs a wait for indexing to complete before a
+ * file can be decided (see decideResolution).
+ */
+const MIN_COLD_INDEXING_MS_FOR_CACHE = 10000;
+
+/**
+ * Whether a project should use its cached index, from the indexing time
+ * measured on a fresh index (`coldIndexing` of project.json, or null when
+ * there is none): `{ kind: 'complete', durationMs }` when indexing completed
+ * in that run, `{ kind: 'incomplete', minimumMs }` when the run ended first.
+ */
+function shouldUseCachedIndex(coldIndexing) {
+  if (coldIndexing === null) return false;
+  const ms = coldIndexing.kind === 'complete' ? coldIndexing.durationMs : coldIndexing.minimumMs;
+  return ms >= MIN_COLD_INDEXING_MS_FOR_CACHE;
+}
+
+/**
+ * The `coldIndexing` to keep after a run on a fresh index measured
+ * `observation`. A completed measurement replaces the previous one. A run that
+ * ended before indexing completed only says indexing takes longer than the
+ * run; it is kept only when that alone shows the project is large and the
+ * previous record does not already say so.
+ */
+function resolveColdIndexingRecord(previous, observation) {
+  if (observation.kind === 'complete') return observation;
+  if (shouldUseCachedIndex(observation) && !shouldUseCachedIndex(previous)) return observation;
+  return previous;
+}
+
+function isValidColdIndexing(value) {
+  if (!value || typeof value !== 'object') return false;
+  const ms = value.kind === 'complete' ? value.durationMs : value.kind === 'incomplete' ? value.minimumMs : NaN;
+  return Number.isFinite(ms) && ms >= 0;
+}
+
+/**
+ * The project record (`<cache>/<key>/project.json`), or null when there is
+ * none or it cannot be read. A `coldIndexing` that is not valid reads as null,
+ * so a damaged record is treated like a project seen for the first time.
+ */
+function readProjectRecord(dir) {
+  let record;
+  try {
+    record = JSON.parse(fs.readFileSync(path.join(dir, 'project.json'), 'utf8'));
+  } catch {
+    return null;
+  }
+  if (!record || typeof record !== 'object' || Array.isArray(record)) return null;
+  return { ...record, coldIndexing: isValidColdIndexing(record.coldIndexing) ? record.coldIndexing : null };
+}
+
+/**
+ * Store what a run on a fresh index measured in the project record, written
+ * whole and renamed into place. The record is kept even for a project that
+ * does not use the cached index, so the next run can decide.
+ */
+function saveColdIndexingRecord(key, { root, extPath, jdkHome }, observation) {
+  try {
+    const dir = ensurePrivateDir(path.join(resolveCurrentCacheRoot(), key));
+    const previous = readProjectRecord(dir);
+    const coldIndexing = resolveColdIndexingRecord(previous ? previous.coldIndexing : null, observation);
+    vlog(`project record: indexing ${JSON.stringify(observation)} on a fresh index; keeping ${JSON.stringify(coldIndexing)}`);
+    const record = {
+      root,
+      extPath,
+      jdkHome,
+      createdAt: previous && Number.isFinite(previous.createdAt) ? previous.createdAt : Date.now(),
+      coldIndexing,
+    };
+    const file = path.join(dir, 'project.json');
+    const tmp = writePrivateTempFile(file, JSON.stringify(record, null, 2));
+    try {
+      fs.renameSync(tmp, file);
+    } catch (err) {
+      removeFileQuietly(tmp);
+      throw err;
+    }
+  } catch (err) {
+    vlog('project record: not saved:', err.message);
+  }
+}
+
 /** How often to look again while a previous run of this project shuts its server down. */
 const OWNER_POLL_MS = 100;
 
@@ -1416,17 +1502,19 @@ async function prepareUserdirForStart(userdir, { hasStaleOwner }, deps = {}) {
 }
 
 /**
- * Get the userdir for this project's server: the cached one when this run
- * can own it, else a new temporary one. Returns
+ * Get the userdir for this project's server: the cached one when the project
+ * is large enough to gain from it (shouldUseCachedIndex) and this run can own
+ * it, else a new temporary one. Returns
  * `{ kind: 'persistent', userdir, ownerLock: { path, nonce } }` or
- * `{ kind: 'temporary', userdir }`.
+ * `{ kind: 'temporary', userdir }`. A project not measured yet (no record, or
+ * one that cannot be read) gets a temporary userdir, whose run measures it.
  *
  * A cached userdir has one owner at a time (owner.lock): two servers on one
  * userdir fight over its documents and index. Another run that is still
  * working means a temporary userdir at once; one that is shutting its server
  * down is waited for, up to `timeoutMs`.
  */
-async function acquireUserdir(key, timeoutMs, { root, extPath, jdkHome }, deps = {}) {
+async function acquireUserdir(key, timeoutMs, deps = {}) {
   const isInspectionAvailable = deps.isInspectionAvailable || isProcessInspectionAvailable;
   if (!isInspectionAvailable()) {
     vlog('userdir: cannot inspect processes; using a temporary one');
@@ -1436,6 +1524,15 @@ async function acquireUserdir(key, timeoutMs, { root, extPath, jdkHome }, deps =
   let userdir;
   try {
     dir = ensurePrivateDir(path.join(resolveCurrentCacheRoot(), key));
+    const record = readProjectRecord(dir);
+    if (!shouldUseCachedIndex(record ? record.coldIndexing : null)) {
+      vlog(
+        record && record.coldIndexing
+          ? `userdir: the index is small (${JSON.stringify(record.coldIndexing)}); using a temporary one`
+          : 'userdir: indexing time not measured yet; using a temporary one'
+      );
+      return createTemporaryUserdir();
+    }
     userdir = ensurePrivateDir(path.join(dir, 'userdir'));
   } catch (err) {
     vlog(`userdir: no cache (${err.message}); using a temporary one`);
@@ -1458,10 +1555,6 @@ async function acquireUserdir(key, timeoutMs, { root, extPath, jdkHome }, deps =
         releaseLockFile(lockPath, r.nonce);
         vlog('userdir: a leftover server could not be stopped; using a temporary one');
         return createTemporaryUserdir();
-      }
-      const info = path.join(dir, 'project.json');
-      if (!fs.existsSync(info)) {
-        fs.writeFileSync(info, JSON.stringify({ root, extPath, jdkHome, createdAt: Date.now() }, null, 2), { mode: 0o600 });
       }
       vlog('userdir (cached):', userdir);
       return { kind: 'persistent', userdir, ownerLock: { path: lockPath, nonce: r.nonce } };
@@ -1621,6 +1714,9 @@ class ServerSession {
     this.timeoutMs = undefined;
     this.completionCount = 0;
     this.indexPhase = { kind: 'indexing' };
+    // When the workspace was opened, and when indexing first completed (null: not yet).
+    this.initializedAtMs = this.startedAtMs;
+    this.firstIndexCompletedAtMs = null;
     // A reused (cached) index can report a file clean before the index is
     // brought up to date, so with one only results after indexing count.
     this.isPersistentUserdir = false;
@@ -1785,11 +1881,25 @@ class ServerSession {
     }, timeoutMs);
     if (process.env.KJF_DUMP) console.error('SERVER CAPS', JSON.stringify(initResult));
     client.notify('initialized', {});
+    this.initializedAtMs = Date.now();
   }
 
   /** Milliseconds since this session started, for -v. */
   measureElapsedMs() {
     return Date.now() - this.startedAtMs;
+  }
+
+  /**
+   * How long indexing took, counted from the moment the workspace was opened
+   * (`initialized`): `{ kind: 'complete', durationMs }`, or, when it had not
+   * completed by `nowMs`, `{ kind: 'incomplete', minimumMs }`.
+   */
+  measureIndexingTime(nowMs) {
+    const from = this.initializedAtMs;
+    if (this.firstIndexCompletedAtMs !== null) {
+      return { kind: 'complete', durationMs: Math.max(0, this.firstIndexCompletedAtMs - from) };
+    }
+    return { kind: 'incomplete', minimumMs: Math.max(0, nowMs - from) };
   }
 
   handleProgress(params) {
@@ -1864,6 +1974,7 @@ class ServerSession {
     if (this.indexPhase.kind === 'complete') return;
     this.completionCount += 1;
     this.indexPhase = { kind: 'complete', completionCount: this.completionCount, completedAtMs: Date.now() };
+    if (this.firstIndexCompletedAtMs === null) this.firstIndexCompletedAtMs = this.indexPhase.completedAtMs;
     vlog(`+${this.measureElapsedMs()}ms indexing complete (${this.completionCount})`);
     this.events.emit('indexPhase');
   }
@@ -2235,6 +2346,7 @@ async function formatFiles(files, context) {
   const notStarted = [...files];
   const isCacheAllowed = !hasMixedProjectRoots(files, opts.root);
   if (!isCacheAllowed) vlog('files from more than one project root; using a temporary userdir');
+  const projectKey = computeProjectKey(rootDir, extPath, jdkHome);
   let exitCode = 0;
   try {
     const segments = splitIntoSegments(files);
@@ -2242,20 +2354,22 @@ async function formatFiles(files, context) {
       const segment = segments[i];
       // Only the first segment can use the cached index: the others exist to
       // give a repeated file a fresh server (see splitIntoSegments).
-      const lease =
-        i === 0 && isCacheAllowed
-          ? await acquireUserdir(computeProjectKey(rootDir, extPath, jdkHome), opts.timeoutMs, {
-              root: rootDir,
-              extPath,
-              jdkHome,
-            })
-          : createTemporaryUserdir();
+      const lease = i === 0 && isCacheAllowed ? await acquireUserdir(projectKey, opts.timeoutMs) : createTemporaryUserdir();
+      let indexing = null;
       await runWithServerSession(context, lease, async (session) => {
         for (const file of segment) {
           notStarted.shift();
           exitCode = Math.max(exitCode, await formatOneFile(session, file, context.opts));
         }
+        indexing = session.measureIndexingTime(Date.now());
       });
+      // A temporary userdir starts from an empty index, so its run tells how
+      // long this project takes to index. A cached one does not: it starts
+      // warm. Files from other roots are indexed too, so such a run does not
+      // count either.
+      if (lease.kind === 'temporary' && isCacheAllowed) {
+        saveColdIndexingRecord(projectKey, { root: rootDir, extPath, jdkHome }, indexing);
+      }
     }
   } catch (err) {
     if (!(err instanceof ServerExitedError)) throw err;
@@ -2362,4 +2476,9 @@ module.exports = {
   hasMixedProjectRoots,
   acquireUserdir,
   prepareUserdirForStart,
+  MIN_COLD_INDEXING_MS_FOR_CACHE,
+  shouldUseCachedIndex,
+  resolveColdIndexingRecord,
+  readProjectRecord,
+  saveColdIndexingRecord,
 };

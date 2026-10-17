@@ -53,4 +53,28 @@ function listLeftovers(env) {
 
 const NO_LEFTOVERS = { temporaryUserdirs: [], ownerLocks: [], netbeansLocks: [], fileLocks: [] };
 
-module.exports = { createIsolatedEnv, listLeftovers, NO_LEFTOVERS };
+/** The project records (project.json) in the environment's cache: [{ key, record }]. */
+function listProjectRecords(env) {
+  const cache = env.KIRO_JAVA_FORMAT_CACHE;
+  if (!fs.existsSync(cache)) return [];
+  return fs
+    .readdirSync(cache)
+    .filter((key) => fs.existsSync(path.join(cache, key, 'project.json')))
+    .map((key) => ({ key, record: JSON.parse(fs.readFileSync(path.join(cache, key, 'project.json'), 'utf8')) }));
+}
+
+/**
+ * Make every project recorded in the cache look large, so the next run uses
+ * the cached index. Tests of the cached path need this: the fixtures index in
+ * a few seconds and would otherwise always use a temporary userdir.
+ */
+function markRecordedProjectsLarge(env) {
+  const records = listProjectRecords(env);
+  if (records.length === 0) throw new Error('no project has been recorded yet');
+  for (const { key, record } of records) {
+    const file = path.join(env.KIRO_JAVA_FORMAT_CACHE, key, 'project.json');
+    fs.writeFileSync(file, JSON.stringify({ ...record, coldIndexing: { kind: 'complete', durationMs: 60000 } }));
+  }
+}
+
+module.exports = { createIsolatedEnv, listLeftovers, NO_LEFTOVERS, listProjectRecords, markRecordedProjectsLarge };

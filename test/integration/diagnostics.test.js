@@ -9,7 +9,7 @@ const assert = require('node:assert');
 const fs = require('fs');
 const path = require('path');
 const { shouldSkipIntegration } = require('../helpers/integration');
-const { createIsolatedEnv } = require('../helpers/env');
+const { createIsolatedEnv, listProjectRecords, markRecordedProjectsLarge } = require('../helpers/env');
 const { FIXTURES, copyFixture, hashTree } = require('../helpers/fixtures');
 const { resolveTestScript, runCli, normalizeOutput } = require('../helpers/cli');
 const { buildGolden, expectedForCall, describeMismatch } = require('../helpers/golden');
@@ -147,6 +147,18 @@ describe('diagnostics', { skip }, () => {
     try {
       const copy = copyFixture('minimal-maven', path.join(env.dir, 'project'));
       const B = FILES[1];
+      // The first run uses a temporary userdir and records the project. B resolves
+      // before indexing completes, so the run may end first; then nothing is
+      // known yet (null), which also keeps the project on temporary userdirs.
+      const measure = await runCli(script, ['-v', path.join(copy, B)], { cwd: copy, env: env.buildEnv() });
+      assert.strictEqual(measure.code, 0, measure.stderr);
+      assert.match(measure.stderr, /indexing time not measured yet; using a temporary one/);
+      const [{ record }] = listProjectRecords(env);
+      t.diagnostic(`recorded: ${JSON.stringify(record.coldIndexing)}`);
+      assert.ok(record.coldIndexing === null || record.coldIndexing.durationMs < 10000, 'minimal-maven is not large');
+      // Make it look large, so the next run builds a cached index.
+      markRecordedProjectsLarge(env);
+      fs.copyFileSync(path.join(FIXTURES, 'minimal-maven', B), path.join(copy, B));
       const first = await runCli(script, ['-v', path.join(copy, B)], { cwd: copy, env: env.buildEnv() });
       assert.strictEqual(first.code, 0, first.stderr);
       assert.match(first.stderr, /userdir \(cached\):/);
@@ -167,18 +179,27 @@ describe('diagnostics', { skip }, () => {
     }
   });
 
-  it('a cached index of a project without a build file still sees indexing complete', async (t) => {
+  it('a project without a build file is recorded small; with a cached index it still sees indexing complete', async (t) => {
     const env = createIsolatedEnv();
     try {
-      for (const round of [1, 2]) {
-        const copy = path.join(env.dir, 'project');
-        if (round === 1) copyFixture('corruption', copy, { gitMarker: true });
+      const copy = path.join(env.dir, 'project');
+      copyFixture('corruption', copy, { gitMarker: true });
+      for (const round of [0, 1, 2, 3]) {
         const r = await runCli(script, ['-v', path.join(copy, 'Alpha.java')], { cwd: copy, env: env.buildEnv() });
         assert.strictEqual(r.code, 0, r.stderr);
-        assert.match(r.stderr, /userdir \(cached\):/);
         const timeline = extractTimeline(r.stderr);
         t.diagnostic(`round ${round} ${r.elapsedMs}ms\n${normalizeOutput(timeline, [copy])}`);
         assert.match(timeline, /indexing complete \(1\)/);
+        if (round <= 1) {
+          // Rounds 0-1: temporary userdirs; the cache holds the record only.
+          assert.match(r.stderr, round === 0 ? /indexing time not measured yet/ : /the index is small/);
+          const [{ key, record }] = listProjectRecords(env);
+          assert.ok(record.coldIndexing.durationMs < 10000, JSON.stringify(record.coldIndexing));
+          assert.ok(!fs.existsSync(path.join(env.KIRO_JAVA_FORMAT_CACHE, key, 'userdir')), 'no cached userdir');
+          if (round === 1) markRecordedProjectsLarge(env);
+        } else {
+          assert.match(r.stderr, /userdir \(cached\):/);
+        }
       }
     } finally {
       await finishEnv(env);
