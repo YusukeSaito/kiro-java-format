@@ -135,6 +135,8 @@ function vlog(...args) {
  */
 const RESOLVE_WAIT_MS = 60000;
 const POLL_MS = 250;
+/** How long a normal exit waits for the server to acknowledge `shutdown`. */
+const SHUTDOWN_WAIT_MS = 2000;
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -287,17 +289,72 @@ function detectRoot(file, explicit) {
 }
 
 // ---------------------------------------------------------------------------
+// Waiting with a limit
+// ---------------------------------------------------------------------------
+
+/** A wait on the language server took longer than --timeout. */
+class TimeoutError extends Error {
+  constructor(timeoutMs) {
+    super(`Timed out after ${timeoutMs / 1000}s waiting for the language server. Try --timeout or --verbose.`);
+    this.name = 'TimeoutError';
+  }
+}
+
+/** The language server went away while it still had work. `code` is its exit code (null after a signal). */
+class ServerExitedError extends Error {
+  constructor(code) {
+    super(`language server exited (code ${code})`);
+    this.name = 'ServerExitedError';
+    this.code = code;
+  }
+}
+
+/**
+ * Settle like `promise`, or reject with TimeoutError after `ms`. The limit is
+ * passed to setTimeout as given, so a NaN limit (`--timeout abc`) fires at
+ * once, as it always has.
+ */
+function awaitWithTimeout(promise, ms) {
+  let timer;
+  const limit = new Promise((resolve, reject) => {
+    timer = setTimeout(() => reject(new TimeoutError(ms)), ms);
+  });
+  return Promise.race([promise, limit]).finally(() => clearTimeout(timer));
+}
+
+// ---------------------------------------------------------------------------
 // Minimal LSP client over a socket
 // ---------------------------------------------------------------------------
 class LspClient {
-  constructor(socket) {
+  /**
+   * `onClose` runs when the connection drops. Without it, pending requests
+   * are failed with ServerExitedError right away.
+   */
+  constructor(socket, { onClose } = {}) {
     this.socket = socket;
     this.buffer = Buffer.alloc(0);
     this.nextId = 1;
     this.pending = new Map();
     this.notificationHandlers = new Map();
     this.requestHandlers = new Map();
+    // Set once the connection is gone; later requests fail with it at once.
+    this.closedError = null;
     socket.on('data', (chunk) => this._onData(chunk));
+    socket.on('error', (err) => vlog('socket error:', err.message));
+    socket.on('close', () => {
+      if (onClose) onClose();
+      else this.rejectAll(new ServerExitedError(null));
+    });
+  }
+
+  /** Fail every pending request with `err`, and every later one too. */
+  rejectAll(err) {
+    if (!this.closedError) this.closedError = err;
+    for (const p of this.pending.values()) {
+      clearTimeout(p.timer);
+      p.reject(err);
+    }
+    this.pending.clear();
   }
 
   _onData(chunk) {
@@ -329,9 +386,11 @@ class LspClient {
 
   _dispatch(msg) {
     if (msg.id !== undefined && (msg.result !== undefined || msg.error !== undefined)) {
+      // A reply to a request that already timed out has no entry and is dropped.
       const p = this.pending.get(msg.id);
       if (p) {
         this.pending.delete(msg.id);
+        clearTimeout(p.timer);
         if (msg.error) p.reject(new Error(msg.error.message || JSON.stringify(msg.error)));
         else p.resolve(msg.result);
       }
@@ -351,17 +410,31 @@ class LspClient {
   }
 
   _send(obj) {
+    if (this.closedError || this.socket.destroyed) return;
     const payload = Buffer.from(JSON.stringify(obj), 'utf8');
     const header = Buffer.from(`Content-Length: ${payload.length}\r\n\r\n`, 'ascii');
     this.socket.write(Buffer.concat([header, payload]));
   }
 
-  request(method, params) {
+  /**
+   * Send a request. With `timeoutMs`, the request fails with TimeoutError when
+   * no reply comes in time; the reply, if it comes later, is dropped.
+   */
+  request(method, params, timeoutMs) {
+    if (this.closedError) return Promise.reject(this.closedError);
     const id = this.nextId++;
     this._send({ jsonrpc: '2.0', id, method, params });
     vlog('req ->', method, id);
     return new Promise((resolve, reject) => {
-      this.pending.set(id, { resolve, reject });
+      const entry = { resolve, reject, timer: null };
+      if (timeoutMs !== undefined) {
+        entry.timer = setTimeout(() => {
+          this.pending.delete(id);
+          vlog('timed out <-', method, id);
+          reject(new TimeoutError(timeoutMs));
+        }, timeoutMs);
+      }
+      this.pending.set(id, entry);
     });
   }
 
@@ -382,18 +455,24 @@ class LspClient {
 // ---------------------------------------------------------------------------
 // Server lifecycle
 // ---------------------------------------------------------------------------
+/**
+ * Spawn nbcode as a language server. Returns the process right away, and
+ * `listening`, which resolves to `{ port, hash }` once the server says where
+ * it listens. Its output is read for as long as it runs, so the server never
+ * blocks on a full pipe.
+ */
 function startServer(nbcodePath, jdkHome, userdir) {
-  return new Promise((resolve, reject) => {
-    const args = [];
-    if (jdkHome) args.push('--jdkhome', jdkHome);
-    args.push('--userdir', userdir);
-    args.push('-J-XX:PerfMaxStringConstLength=10240');
-    args.push('--start-java-language-server=listen-hash:0');
-    args.push('-J--add-exports=jdk.compiler/com.sun.tools.javac.resources=ALL-UNNAMED');
+  const args = [];
+  if (jdkHome) args.push('--jdkhome', jdkHome);
+  args.push('--userdir', userdir);
+  args.push('-J-XX:PerfMaxStringConstLength=10240');
+  args.push('--start-java-language-server=listen-hash:0');
+  args.push('-J--add-exports=jdk.compiler/com.sun.tools.javac.resources=ALL-UNNAMED');
 
-    vlog('spawn', nbcodePath, args.join(' '));
-    const proc = spawn(nbcodePath, args, { cwd: userdir, stdio: ['ignore', 'pipe', 'pipe'] });
+  vlog('spawn', nbcodePath, args.join(' '));
+  const proc = spawn(nbcodePath, args, { cwd: userdir, stdio: ['ignore', 'pipe', 'pipe'] });
 
+  const listening = new Promise((resolve, reject) => {
     let started = false;
     let stderr = '';
     proc.stdout.on('data', (chunk) => {
@@ -403,12 +482,12 @@ function startServer(nbcodePath, jdkHome, userdir) {
         const info = text.match(/Java Language Server listening at port (\d+) with hash (\S+)/);
         if (info) {
           started = true;
-          resolve({ proc, port: parseInt(info[1], 10), hash: info[2] });
+          resolve({ port: parseInt(info[1], 10), hash: info[2] });
         }
       }
     });
     proc.stderr.on('data', (chunk) => {
-      stderr += chunk.toString();
+      if (!started) stderr += chunk.toString();
       vlog('server stderr:', chunk.toString().trimEnd());
     });
     proc.on('error', (err) => reject(err));
@@ -416,6 +495,7 @@ function startServer(nbcodePath, jdkHome, userdir) {
       if (!started) reject(new Error(`nbcode exited (code ${code}) before starting the LSP server.\n${stderr}`));
     });
   });
+  return { proc, listening };
 }
 
 function connect(port, hash) {
@@ -947,10 +1027,12 @@ async function runWithFileLock(file, timeoutMs, fn) {
  * the file.
  */
 class ServerSession {
-  constructor(proc, socket, client) {
+  constructor(proc) {
     this.proc = proc;
-    this.socket = socket;
-    this.client = client;
+    this.socket = null;
+    this.client = null;
+    // Set when the server process exits: `{ code }`.
+    this.exitInfo = null;
     // Organizing imports rewrites the whole import block from the types the
     // compiler can resolve. Before the project's classpath is ready nothing
     // resolves, so the server would drop every import it cannot see. Track
@@ -959,21 +1041,44 @@ class ServerSession {
     // Some code actions push their result instead of returning it. Keep the
     // last pushed edit so the organize-imports step can pick it up.
     this.pushedEdit = null;
+    proc.on('exit', (code) => {
+      this.exitInfo = { code };
+      vlog('server exited, code', code);
+      if (this.client) this.client.rejectAll(new ServerExitedError(code));
+    });
   }
 
-  /** Start nbcode, connect to it and initialize the workspace at rootDir. */
-  static async start({ nbcodePath, jdkHome, userdir, rootDir }) {
-    const server = await startServer(nbcodePath, jdkHome, userdir);
+  /**
+   * Start nbcode, connect to it and initialize the workspace at rootDir. Each
+   * of the three waits may take up to `timeoutMs`; past that, TimeoutError.
+   */
+  static async start({ nbcodePath, jdkHome, userdir, rootDir, timeoutMs }) {
+    const { proc, listening } = startServer(nbcodePath, jdkHome, userdir);
+    const session = new ServerSession(proc);
     try {
-      const socket = await connect(server.port, server.hash);
-      const session = new ServerSession(server.proc, socket, new LspClient(socket));
+      const { port, hash } = await awaitWithTimeout(listening, timeoutMs);
+      session.socket = await awaitWithTimeout(connect(port, hash), timeoutMs);
+      session.client = new LspClient(session.socket, { onClose: () => session.failPendingAfterExit() });
       session.registerHandlers();
-      await session.initialize(rootDir);
+      await session.initialize(rootDir, timeoutMs);
       return session;
     } catch (err) {
-      server.proc.kill();
+      proc.kill();
       throw err;
     }
+  }
+
+  /**
+   * The connection dropped. Fail what is pending with the exit code once the
+   * process is gone (the exit usually follows within moments).
+   */
+  failPendingAfterExit() {
+    if (this.exitInfo) {
+      this.client.rejectAll(new ServerExitedError(this.exitInfo.code));
+      return;
+    }
+    const timer = setTimeout(() => this.client.rejectAll(new ServerExitedError(null)), SHUTDOWN_WAIT_MS);
+    this.proc.once('exit', () => clearTimeout(timer));
   }
 
   registerHandlers() {
@@ -1011,7 +1116,7 @@ class ServerSession {
     });
   }
 
-  async initialize(rootDir) {
+  async initialize(rootDir, timeoutMs) {
     const client = this.client;
     const rootUri = pathToFileURL(rootDir).href;
     const initResult = await client.request('initialize', {
@@ -1064,7 +1169,7 @@ class ServerSession {
         },
       },
       workspaceFolders: [{ uri: rootUri, name: path.basename(rootDir) }],
-    });
+    }, timeoutMs);
     if (process.env.KJF_DUMP) console.error('SERVER CAPS', JSON.stringify(initResult));
     client.notify('initialized', {});
   }
@@ -1088,12 +1193,13 @@ class ServerSession {
    * Diagnostics can be published more than once as analysis progresses, so a
    * clean result is awaited rather than the first result.
    */
-  async waitUntilResolves(uri) {
-    const deadline = Date.now() + RESOLVE_WAIT_MS;
+  async waitUntilResolves(uri, capMs) {
+    const deadline = Date.now() + capMs;
     for (;;) {
+      if (this.exitInfo) throw new ServerExitedError(this.exitInfo.code);
       const errors = this.findErrors(uri);
       if (errors && errors.length === 0) return true;
-      if (Date.now() >= deadline) {
+      if (hasDeadlinePassed(deadline)) {
         vlog(errors ? `still ${errors.length} error(s)` : 'no diagnostics received');
         return false;
       }
@@ -1152,7 +1258,7 @@ class ServerSession {
    * nothing to do. Formatting runs afterwards, so this only has to get the
    * import block right — not its indentation.
    */
-  async organizeImports(doc, text) {
+  async organizeImports(doc, text, timeoutMs) {
     const client = this.client;
     const uri = doc.uri;
     // An edit pushed while an earlier file was organized must not be taken
@@ -1160,12 +1266,17 @@ class ServerSession {
     this.pushedEdit = null;
     let actions;
     try {
-      actions = await client.request('textDocument/codeAction', {
-        textDocument: { uri },
-        range: fullRange(text),
-        context: { diagnostics: [], only: ['source.organizeImports'] },
-      });
+      actions = await client.request(
+        'textDocument/codeAction',
+        {
+          textDocument: { uri },
+          range: fullRange(text),
+          context: { diagnostics: [], only: ['source.organizeImports'] },
+        },
+        timeoutMs
+      );
     } catch (err) {
+      if (isServerUnusable(err)) throw err;
       // Leave the imports rather than the whole file: formatting still works.
       vlog('textDocument/codeAction failed:', err.message);
       return text;
@@ -1186,8 +1297,9 @@ class ServerSession {
     let resolved = action;
     if (!resolved.edit) {
       try {
-        resolved = await client.request('codeAction/resolve', action);
+        resolved = await client.request('codeAction/resolve', action, timeoutMs);
       } catch (err) {
+        if (isServerUnusable(err)) throw err;
         vlog('codeAction/resolve failed:', err.message);
         return text;
       }
@@ -1200,23 +1312,33 @@ class ServerSession {
     return applyEdits(text, edits);
   }
 
-  formatDocument(doc, { tabSize, insertSpaces }) {
-    return this.client.request('textDocument/formatting', {
-      textDocument: { uri: doc.uri },
-      options: { tabSize, insertSpaces },
-    });
+  formatDocument(doc, { tabSize, insertSpaces }, timeoutMs) {
+    return this.client.request(
+      'textDocument/formatting',
+      { textDocument: { uri: doc.uri }, options: { tabSize, insertSpaces } },
+      timeoutMs
+    );
   }
 
   /** Ask the server to shut down and close the connection. */
   async close() {
     try {
-      await this.client.request('shutdown', null);
+      await this.client.request('shutdown', null, SHUTDOWN_WAIT_MS);
       this.client.notify('exit', null);
     } catch {
       /* ignore */
     }
     this.socket.end();
   }
+}
+
+/**
+ * Errors after which the server cannot be asked anything more for this file:
+ * it did not answer in time, or it is gone. Other error replies leave the
+ * imports as they are and formatting goes on.
+ */
+function isServerUnusable(err) {
+  return err instanceof TimeoutError || err instanceof ServerExitedError;
 }
 
 // ---------------------------------------------------------------------------
@@ -1247,8 +1369,8 @@ async function formatLockedFile(session, file, opts) {
     doc = session.openDocument(uri, current);
 
     if (opts.organizeImports) {
-      if (await session.waitUntilResolves(uri)) {
-        const organized = await session.organizeImports(doc, current);
+      if (await session.waitUntilResolves(uri, Math.min(RESOLVE_WAIT_MS, opts.timeoutMs))) {
+        const organized = await session.organizeImports(doc, current, opts.timeoutMs);
         if (organized !== current) {
           current = organized;
           // Hand the server what we hold, so the formatting edits line up
@@ -1262,7 +1384,11 @@ async function formatLockedFile(session, file, opts) {
       }
     }
 
-    const edits = await session.formatDocument(doc, { tabSize: opts.tabSize, insertSpaces: opts.insertSpaces });
+    const edits = await session.formatDocument(
+      doc,
+      { tabSize: opts.tabSize, insertSpaces: opts.insertSpaces },
+      opts.timeoutMs
+    );
 
     session.closeDocument(doc);
     doc = null;
@@ -1291,6 +1417,8 @@ async function formatLockedFile(session, file, opts) {
       }
     }
     console.error(`error: ${file}: ${err && err.message ? err.message : String(err)}`);
+    // Without a server nothing else can be formatted; formatFiles reports the rest.
+    if (err instanceof ServerExitedError) throw err;
     return 1;
   }
 }
@@ -1326,26 +1454,38 @@ function splitIntoSegments(files) {
  * Format `files` in order and return the exit code. Each segment (see
  * splitIntoSegments) runs in its own language server. Throws when a server
  * cannot be started; failures of single files are reported by formatOneFile.
+ *
+ * When a server exits in the middle, every file it did not get to is
+ * reported with the same error at once, and no further server is started.
  */
 async function formatFiles(files, context) {
+  const notStarted = [...files];
   let exitCode = 0;
-  for (const segment of splitIntoSegments(files)) {
-    exitCode = Math.max(exitCode, await formatSegment(segment, context));
+  try {
+    for (const segment of splitIntoSegments(files)) {
+      await runWithServerSession(context, async (session) => {
+        for (const file of segment) {
+          notStarted.shift();
+          exitCode = Math.max(exitCode, await formatOneFile(session, file, context.opts));
+        }
+      });
+    }
+  } catch (err) {
+    if (!(err instanceof ServerExitedError)) throw err;
+    for (const file of notStarted) console.error(`error: ${file}: ${err.message}`);
+    return 1;
   }
   return exitCode;
 }
 
-async function formatSegment(files, { opts, nbcodePath, jdkHome, rootDir }) {
+/** Start a language server in a new temporary userdir, run `fn` with it, then shut it down. */
+async function runWithServerSession({ opts, nbcodePath, jdkHome, rootDir }, fn) {
   const userdir = fs.mkdtempSync(path.join(os.tmpdir(), 'kiro-java-format-userdir-'));
   let session = null;
   try {
-    session = await ServerSession.start({ nbcodePath, jdkHome, userdir, rootDir });
-    let exitCode = 0;
-    for (const file of files) {
-      exitCode = Math.max(exitCode, await formatOneFile(session, file, opts));
-    }
+    session = await ServerSession.start({ nbcodePath, jdkHome, userdir, rootDir, timeoutMs: opts.timeoutMs });
+    await fn(session);
     await session.close();
-    return exitCode;
   } finally {
     if (session) session.proc.kill();
     cleanup(userdir);
@@ -1375,19 +1515,13 @@ async function main() {
   const rootDir = detectRoot(opts.files[0], opts.root);
   vlog('root:', rootDir);
 
-  const timeout = setTimeout(() => {
-    fail(`Timed out after ${opts.timeoutMs / 1000}s waiting for the language server. Try --timeout or --verbose.`);
-  }, opts.timeoutMs);
-
   let exitCode = 0;
   try {
     exitCode = await formatFiles(opts.files, { opts, nbcodePath, jdkHome, rootDir });
   } catch (err) {
-    clearTimeout(timeout);
     fail(err && err.message ? err.message : String(err));
   }
 
-  clearTimeout(timeout);
   process.exit(exitCode);
 }
 
@@ -1428,4 +1562,8 @@ module.exports = {
   writeFileIfUnchanged,
   resolveLockDir,
   runWithFileLock,
+  TimeoutError,
+  ServerExitedError,
+  awaitWithTimeout,
+  LspClient,
 };
