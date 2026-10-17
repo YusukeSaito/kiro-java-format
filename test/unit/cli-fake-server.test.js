@@ -6,7 +6,7 @@
 const test = require('node:test');
 const assert = require('node:assert');
 const fs = require('fs');
-const { createIsolatedEnv } = require('../helpers/env');
+const { createIsolatedEnv, listLeftovers, NO_LEFTOVERS } = require('../helpers/env');
 const { resolveTestScript, runCli } = require('../helpers/cli');
 const { buildFakeEnv, writeJavaFiles } = require('../helpers/fake');
 const { waitForNoProcessesWithToken, killOwnPids } = require('../helpers/processes');
@@ -18,10 +18,10 @@ async function runFake(t, { files = 1, args = [], fake = {} } = {}) {
   t.after(async () => {
     const left = await waitForNoProcessesWithToken(env.dir, 15000);
     killOwnPids(left.map((p) => p.pid));
-    const userdirs = fs.readdirSync(env.dir).filter((n) => n.startsWith('kiro-java-format-userdir-'));
+    const leftovers = listLeftovers(env);
     env.cleanup();
     assert.deepStrictEqual(left, [], 'no process of the run is left');
-    assert.deepStrictEqual(userdirs, [], 'no temporary userdir is left');
+    assert.deepStrictEqual(leftovers, NO_LEFTOVERS, 'no userdir or lock is left');
   });
   const paths = writeJavaFiles(env.dir, files);
   const r = await runCli(script, [...args, ...paths], { cwd: env.dir, env: buildFakeEnv(env, fake), timeoutMs: 60000 });

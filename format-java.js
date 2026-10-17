@@ -1051,6 +1051,7 @@ function releaseHeldFileLocks() {
 async function prepareForExit({ isAbnormal }) {
   releaseHeldFileLocks();
   for (const server of startedServers) {
+    server.markOwnerLockReleasing();
     if (isAbnormal) signalOwnServer(server.proc, 'SIGTERM');
   }
   for (const server of startedServers) {
@@ -1345,6 +1346,167 @@ async function runWithFileLock(file, timeoutMs, fn) {
 }
 
 // ---------------------------------------------------------------------------
+// Keeping the language server's index per project
+// ---------------------------------------------------------------------------
+
+function resolveRealPath(p) {
+  try {
+    return fs.realpathSync(p);
+  } catch {
+    return path.resolve(p);
+  }
+}
+
+/**
+ * The cache key of a project: its root, the extension (whose directory name
+ * carries its version) and the JDK. A different extension or JDK gets an
+ * index of its own.
+ */
+function computeProjectKey(rootDir, extPath, jdkHome) {
+  const parts = [resolveRealPath(rootDir), resolveRealPath(extPath), jdkHome ? resolveRealPath(jdkHome) : null];
+  return crypto.createHash('sha256').update(JSON.stringify(parts)).digest('hex').slice(0, 16);
+}
+
+/**
+ * Whether the files come from more than one project root (by the same rule
+ * as the root itself). Such a call runs in a temporary userdir: the server
+ * would open the other roots' projects too, and remember them in a cached
+ * index, so later runs of this root could resolve differently.
+ */
+function hasMixedProjectRoots(files, explicitRoot) {
+  if (explicitRoot) return false;
+  const root = detectRoot(files[0], null);
+  return files.some((f) => detectRoot(f, null) !== root);
+}
+
+function createTemporaryUserdir() {
+  return { kind: 'temporary', userdir: fs.mkdtempSync(path.join(os.tmpdir(), 'kiro-java-format-userdir-')) };
+}
+
+/** How often to look again while a previous run of this project shuts its server down. */
+const OWNER_POLL_MS = 100;
+
+/**
+ * Make a cached userdir safe to start nbcode in. Only when there is a trace of
+ * a run that did not end cleanly (its owner lock was stale, or NetBeans' lock
+ * file is still there) are processes looked at: a leftover server of ours on
+ * this userdir is stopped and the NetBeans lock removed. Returns
+ * `{ isReady: false }` when that cannot be done or confirmed.
+ */
+async function prepareUserdirForStart(userdir, { hasStaleOwner }, deps = {}) {
+  const find = deps.find || findProcessesUsingUserdir;
+  const netbeansLock = path.join(userdir, 'lock');
+  if (!hasStaleOwner && !fs.existsSync(netbeansLock)) return { isReady: true };
+  const found = await find(userdir);
+  if (!found.isAvailable) {
+    vlog('userdir: cannot list processes:', found.reason);
+    return { isReady: false };
+  }
+  if (found.processes.length > 0) {
+    vlog(`userdir: stopping ${found.processes.length} leftover process(es)`);
+    const { isTerminated } = await terminateServerProcesses(
+      { pgid: null, launcherPid: null, userdir },
+      JVM_EXIT_GRACE_MS,
+      { find }
+    );
+    if (!isTerminated) return { isReady: false };
+  }
+  removeFileQuietly(netbeansLock);
+  return { isReady: true };
+}
+
+/**
+ * Get the userdir for this project's server: the cached one when this run
+ * can own it, else a new temporary one. Returns
+ * `{ kind: 'persistent', userdir, ownerLock: { path, nonce } }` or
+ * `{ kind: 'temporary', userdir }`.
+ *
+ * A cached userdir has one owner at a time (owner.lock): two servers on one
+ * userdir fight over its documents and index. Another run that is still
+ * working means a temporary userdir at once; one that is shutting its server
+ * down is waited for, up to `timeoutMs`.
+ */
+async function acquireUserdir(key, timeoutMs, { root, extPath, jdkHome }, deps = {}) {
+  const isInspectionAvailable = deps.isInspectionAvailable || isProcessInspectionAvailable;
+  if (!isInspectionAvailable()) {
+    vlog('userdir: cannot inspect processes; using a temporary one');
+    return createTemporaryUserdir();
+  }
+  let dir;
+  let userdir;
+  try {
+    dir = ensurePrivateDir(path.join(resolveCurrentCacheRoot(), key));
+    userdir = ensurePrivateDir(path.join(dir, 'userdir'));
+  } catch (err) {
+    vlog(`userdir: no cache (${err.message}); using a temporary one`);
+    return createTemporaryUserdir();
+  }
+  const lockPath = path.join(dir, 'owner.lock');
+  const startedAt = Date.now();
+  const deadlineMs = startedAt + timeoutMs;
+  let hasStaleOwner = false;
+  for (;;) {
+    const r = acquireLockFile(lockPath, { state: 'running' });
+    if (r.kind === 'unusable') {
+      vlog(`userdir: no owner lock (${r.reason}); using a temporary one`);
+      return createTemporaryUserdir();
+    }
+    if (r.kind === 'acquired') {
+      vlog(`userdir: waited ${Date.now() - startedAt}ms for the previous server`);
+      const { isReady } = await prepareUserdirForStart(userdir, { hasStaleOwner });
+      if (!isReady) {
+        releaseLockFile(lockPath, r.nonce);
+        vlog('userdir: a leftover server could not be stopped; using a temporary one');
+        return createTemporaryUserdir();
+      }
+      const info = path.join(dir, 'project.json');
+      if (!fs.existsSync(info)) {
+        fs.writeFileSync(info, JSON.stringify({ root, extPath, jdkHome, createdAt: Date.now() }, null, 2), { mode: 0o600 });
+      }
+      vlog('userdir (cached):', userdir);
+      return { kind: 'persistent', userdir, ownerLock: { path: lockPath, nonce: r.nonce } };
+    }
+
+    let read;
+    try {
+      read = readLockRecord(lockPath);
+    } catch (err) {
+      vlog(`userdir: cannot read the owner lock (${err.message}); using a temporary one`);
+      return createTemporaryUserdir();
+    }
+    if (read.kind === 'missing') continue;
+    if (read.kind === 'parsed') {
+      const record = read.record;
+      const shouldVerifyCommandLine = !(Date.now() - record.createdAt < LOCK_PID_CHECK_AGE_MS);
+      const isAliveOrUnknown = async (pid) => {
+        if (!Number.isInteger(pid)) return false;
+        const p = await inspectToolProcess(pid, { shouldVerifyCommandLine });
+        return !p.isAvailable || p.isAlive;
+      };
+      const isOwnerAlive = await isAliveOrUnknown(record.pid);
+      if (isOwnerAlive && record.state === 'running') {
+        vlog('userdir: in use by another run; using a temporary one');
+        return createTemporaryUserdir();
+      }
+      const isWatchdogAlive = await isAliveOrUnknown(record.server && record.server.watchdogPid);
+      if (!isOwnerAlive && !isWatchdogAlive && breakStaleLock(lockPath, read)) {
+        hasStaleOwner = true;
+        continue;
+      }
+    } else if ((await isLockStale(read, Date.now())) && breakStaleLock(lockPath, read)) {
+      hasStaleOwner = true;
+      continue;
+    }
+    // The previous run is shutting its server down.
+    if (hasDeadlinePassed(deadlineMs)) {
+      vlog('userdir: the previous server did not finish in time; using a temporary one');
+      return createTemporaryUserdir();
+    }
+    await waitMs(OWNER_POLL_MS);
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Deciding whether a file resolves
 // ---------------------------------------------------------------------------
 
@@ -1462,6 +1624,8 @@ class ServerSession {
     // A reused (cached) index can report a file clean before the index is
     // brought up to date, so with one only results after indexing count.
     this.isPersistentUserdir = false;
+    // `{ path, nonce }` of the cached userdir's owner lock, when this server uses one.
+    this.ownerLock = null;
     // 'diagnostics' (uri), 'indexPhase', 'exit'
     this.events = new EventEmitter();
     // Some code actions push their result instead of returning it. Keep the
@@ -1482,23 +1646,36 @@ class ServerSession {
    * The watchdog is started in the same tick as nbcode, so there is no
    * moment in which this process could die and leave the server unwatched.
    */
-  static async start({ nbcodePath, jdkHome, userdir, rootDir, timeoutMs, isTemporaryUserdir }) {
+  static async start({ nbcodePath, jdkHome, rootDir, timeoutMs, lease }) {
+    const { userdir } = lease;
+    const ownerLock = lease.kind === 'persistent' ? lease.ownerLock : null;
     const { proc, listening } = startServer(nbcodePath, jdkHome, userdir);
     const session = new ServerSession(proc);
     session.timeoutMs = timeoutMs;
+    session.isPersistentUserdir = lease.kind === 'persistent';
+    session.ownerLock = ownerLock;
     const isPosix = process.platform !== 'win32';
     session.watchdogConfig = {
       pgid: isPosix ? proc.pid : null,
       launcherPid: proc.pid,
       userdir,
-      isTemporaryUserdir,
-      ownerLockPath: null,
-      lockNonce: null,
+      isTemporaryUserdir: lease.kind === 'temporary',
+      ownerLockPath: ownerLock ? ownerLock.path : null,
+      lockNonce: ownerLock ? ownerLock.nonce : null,
     };
     session.watchdog = spawnServerWatchdog(session.watchdogConfig, () => {
       session.watchdog = null;
     });
     startedServers.add(session);
+    if (ownerLock) {
+      updateLockFile(ownerLock.path, ownerLock.nonce, {
+        server: {
+          pgid: session.watchdogConfig.pgid,
+          launcherPid: proc.pid,
+          watchdogPid: session.watchdog ? session.watchdog.pid : null,
+        },
+      });
+    }
     try {
       const { port, hash } = await awaitWithTimeout(listening, timeoutMs);
       session.socket = await awaitWithTimeout(connect(port, hash), timeoutMs);
@@ -1913,7 +2090,16 @@ class ServerSession {
     } catch {
       /* ignore */
     }
+    this.markOwnerLockReleasing();
     this.socket.end();
+  }
+
+  /**
+   * Tell the next run that this server is on its way out (it then waits for
+   * the watchdog instead of taking a temporary userdir).
+   */
+  markOwnerLockReleasing() {
+    if (this.ownerLock) updateLockFile(this.ownerLock.path, this.ownerLock.nonce, { state: 'releasing' });
   }
 }
 
@@ -2045,11 +2231,26 @@ function splitIntoSegments(files) {
  * reported with the same error at once, and no further server is started.
  */
 async function formatFiles(files, context) {
+  const { opts, extPath, jdkHome, rootDir } = context;
   const notStarted = [...files];
+  const isCacheAllowed = !hasMixedProjectRoots(files, opts.root);
+  if (!isCacheAllowed) vlog('files from more than one project root; using a temporary userdir');
   let exitCode = 0;
   try {
-    for (const segment of splitIntoSegments(files)) {
-      await runWithServerSession(context, async (session) => {
+    const segments = splitIntoSegments(files);
+    for (let i = 0; i < segments.length; i++) {
+      const segment = segments[i];
+      // Only the first segment can use the cached index: the others exist to
+      // give a repeated file a fresh server (see splitIntoSegments).
+      const lease =
+        i === 0 && isCacheAllowed
+          ? await acquireUserdir(computeProjectKey(rootDir, extPath, jdkHome), opts.timeoutMs, {
+              root: rootDir,
+              extPath,
+              jdkHome,
+            })
+          : createTemporaryUserdir();
+      await runWithServerSession(context, lease, async (session) => {
         for (const file of segment) {
           notStarted.shift();
           exitCode = Math.max(exitCode, await formatOneFile(session, file, context.opts));
@@ -2065,20 +2266,12 @@ async function formatFiles(files, context) {
 }
 
 /**
- * Start a language server in a new temporary userdir, run `fn` with it, then
- * ask it to exit. Waiting for the JVM to go and deleting the userdir are left
- * to its watchdog.
+ * Start a language server in the userdir of `lease`, run `fn` with it, then
+ * ask it to exit. Waiting for the JVM to go, deleting a temporary userdir and
+ * releasing the owner lock are left to its watchdog.
  */
-async function runWithServerSession({ opts, nbcodePath, jdkHome, rootDir }, fn) {
-  const userdir = fs.mkdtempSync(path.join(os.tmpdir(), 'kiro-java-format-userdir-'));
-  const session = await ServerSession.start({
-    nbcodePath,
-    jdkHome,
-    userdir,
-    rootDir,
-    timeoutMs: opts.timeoutMs,
-    isTemporaryUserdir: true,
-  });
+async function runWithServerSession({ opts, nbcodePath, jdkHome, rootDir }, lease, fn) {
+  const session = await ServerSession.start({ nbcodePath, jdkHome, rootDir, timeoutMs: opts.timeoutMs, lease });
   await fn(session);
   await session.close();
 }
@@ -2113,7 +2306,7 @@ async function main() {
 
   let exitCode = 0;
   try {
-    exitCode = await formatFiles(opts.files, { opts, nbcodePath, jdkHome, rootDir });
+    exitCode = await formatFiles(opts.files, { opts, extPath, nbcodePath, jdkHome, rootDir });
   } catch (err) {
     await prepareForExit({ isAbnormal: true });
     fail(err && err.message ? err.message : String(err));
@@ -2165,4 +2358,8 @@ module.exports = {
   selectEntryAfterRequest,
   ServerSession,
   POST_INDEX_SETTLE_MS,
+  computeProjectKey,
+  hasMixedProjectRoots,
+  acquireUserdir,
+  prepareUserdirForStart,
 };

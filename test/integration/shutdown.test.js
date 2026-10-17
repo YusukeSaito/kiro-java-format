@@ -6,10 +6,9 @@
 
 const { describe, it } = require('node:test');
 const assert = require('node:assert');
-const fs = require('fs');
 const path = require('path');
 const { shouldSkipIntegration } = require('../helpers/integration');
-const { createIsolatedEnv } = require('../helpers/env');
+const { createIsolatedEnv, listLeftovers, NO_LEFTOVERS } = require('../helpers/env');
 const { copyFixture } = require('../helpers/fixtures');
 const { resolveTestScript, startCli } = require('../helpers/cli');
 const { listProcessesWithToken, waitForNoProcessesWithToken, killOwnPids, spawnDecoy, isAlive } = require('../helpers/processes');
@@ -19,10 +18,6 @@ const FILES = ['Alpha.java', 'Beta.java', 'Gamma.java', 'Delta.java', 'Epsilon.j
 const SETTLE_MS = 12000;
 const skip = shouldSkipIntegration();
 const script = resolveTestScript();
-
-function listTemporaryUserdirs(dir) {
-  return fs.readdirSync(dir).filter((n) => n.startsWith('kiro-java-format-userdir-'));
-}
 
 async function waitForServerProcess(token, timeoutMs) {
   const deadline = Date.now() + timeoutMs;
@@ -55,7 +50,10 @@ async function runAndEnd(t, { args = [], endWith = null }) {
     const left = await waitForNoProcessesWithToken(env.dir, SETTLE_MS, { exceptPids: decoys.map((d) => d.pid) });
     t.diagnostic(`left after ${Date.now() - endedAt}ms: ${left.length}`);
     assert.deepStrictEqual(left, [], 'no process of the run is left');
-    assert.deepStrictEqual(listTemporaryUserdirs(env.dir), [], 'no temporary userdir is left');
+    const leftovers = listLeftovers(env);
+    // A CLI killed with SIGKILL cannot release its file lock; the next run breaks it as stale.
+    if (endWith === 'SIGKILL') leftovers.fileLocks = [];
+    assert.deepStrictEqual(leftovers, NO_LEFTOVERS, 'no temporary userdir or lock is left');
     for (const d of decoys) assert.ok(isAlive(d.pid), `decoy ${d.pid} is alive`);
     return result;
   } finally {

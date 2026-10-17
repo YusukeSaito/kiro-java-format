@@ -42,11 +42,13 @@ async function runMainSequence({ mainScript, prepareCopy, files, flags, timeoutM
   const copy = path.join(work, 'project');
   try {
     prepareCopy(copy);
+    // `{COPY}` in a flag stands for the copy's path (e.g. `--root {COPY}/a`).
+    const args = flags.map((f) => f.split('{COPY}').join(copy));
     const perFile = [];
     for (const rel of files) {
       const tmp = fs.mkdtempSync(path.join(work, 'tmp-'));
       const env = { ...process.env, TMPDIR: tmp, KIRO_JAVA_FORMAT_CACHE: path.join(tmp, 'cache') };
-      const r = await runCli(mainScript, [...flags, path.join(copy, rel)], { cwd: copy, env, timeoutMs });
+      const r = await runCli(mainScript, [...args, path.join(copy, rel)], { cwd: copy, env, timeoutMs });
       // main does not wait for its JVM; let it go before the next run.
       const left = await waitForNoProcessesWithToken(tmp, 15000);
       killOwnPids(left.map((p) => p.pid));
