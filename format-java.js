@@ -1372,7 +1372,17 @@ function selectEntryAfterRequest(entry, freshRequest) {
  * shouldRequestFreshDiagnostics }`, where `wakeAtMs` is when the answer can
  * change with time alone (the limit, when nothing earlier).
  */
-function decideResolution({ entry, indexPhase, openedAtMs, nowMs, capMs, settleMs }) {
+function decideResolution({
+  entry,
+  indexPhase,
+  isPersistentUserdir,
+  completionCountAtOpen,
+  freshRequest,
+  openedAtMs,
+  nowMs,
+  capMs,
+  settleMs,
+}) {
   const capAtMs = openedAtMs + capMs;
   const pending = (wakeAtMs = capAtMs) => ({ kind: 'pending', wakeAtMs, shouldRequestFreshDiagnostics: false });
 
@@ -1380,6 +1390,26 @@ function decideResolution({ entry, indexPhase, openedAtMs, nowMs, capMs, settleM
   if (!(nowMs < capAtMs)) {
     return entry !== null && entry.errorCount === 0 ? { kind: 'resolved' } : { kind: 'unresolved', reason: 'wait limit' };
   }
+
+  // With a cached index, a result computed before indexing completes may come
+  // from the stale index, so nothing is decided while indexing runs.
+  if (isPersistentUserdir && indexPhase.kind === 'indexing') return pending();
+  // A document opened before the latest completion has results computed
+  // before it: ask for fresh diagnostics once per completion, then decide on
+  // the first result that arrived after asking, once it stops changing.
+  const isOpenedBeforeCompletion =
+    isPersistentUserdir && indexPhase.kind === 'complete' && completionCountAtOpen !== indexPhase.completionCount;
+  if (isOpenedBeforeCompletion) {
+    if (freshRequest === null || freshRequest.completionCount !== indexPhase.completionCount) {
+      return { kind: 'pending', wakeAtMs: capAtMs, shouldRequestFreshDiagnostics: true };
+    }
+    const fresh = selectEntryAfterRequest(entry, freshRequest);
+    if (fresh === null) return pending();
+    const settledAtMs = fresh.arrivedAtMs + settleMs;
+    if (nowMs < settledAtMs) return pending(settledAtMs);
+    return fresh.errorCount === 0 ? { kind: 'resolved' } : { kind: 'unresolved', reason: 'errors after indexing' };
+  }
+
   // No errors: resolved, even before indexing completes (a fresh index has
   // nothing stale to report).
   if (entry !== null && entry.errorCount === 0) return { kind: 'resolved' };
@@ -1706,6 +1736,12 @@ class ServerSession {
           capMs,
           settleMs: POST_INDEX_SETTLE_MS,
         });
+        if (decision.kind === 'pending' && decision.shouldRequestFreshDiagnostics) {
+          this.requestFreshDiagnostics(doc);
+          doc.freshRequest = { completionCount: this.completionCount, requestedAtMs: Date.now() };
+          evaluate();
+          return;
+        }
         if (decision.kind === 'pending') {
           clearTimeout(timer);
           timer = setTimeout(evaluate, Math.max(0, decision.wakeAtMs - nowMs));
@@ -1765,6 +1801,29 @@ class ServerSession {
       contentChanges: [{ range: fullRange(doc.serverText), text }],
     });
     doc.serverText = text;
+  }
+
+  /**
+   * Make the server compute the document's diagnostics again, without
+   * changing its content: a didChange that replaces the first character with
+   * itself (for an empty document, a newline inserted and removed again).
+   */
+  requestFreshDiagnostics(doc) {
+    const send = (range, text) => {
+      doc.version += 1;
+      this.client.notify('textDocument/didChange', {
+        textDocument: { uri: doc.uri, version: doc.version },
+        contentChanges: [{ range, text }],
+      });
+    };
+    const at = (line, character) => ({ line, character });
+    if (doc.serverText.length > 0) {
+      send({ start: at(0, 0), end: at(0, 1) }, doc.serverText[0]);
+    } else {
+      send({ start: at(0, 0), end: at(0, 0) }, '\n');
+      send({ start: at(0, 0), end: at(1, 0) }, '');
+    }
+    vlog(`+${this.measureElapsedMs()}ms requested fresh diagnostics for ${doc.uri}`);
   }
 
   closeDocument(doc) {

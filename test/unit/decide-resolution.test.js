@@ -88,6 +88,61 @@ test('at the limit the latest result decides', () => {
   assert.deepStrictEqual(decide({ capMs: NaN }), { kind: 'unresolved', reason: 'wait limit' });
 });
 
+const requestFresh = { kind: 'pending', wakeAtMs: OPENED + CAP, shouldRequestFreshDiagnostics: true };
+
+test('with a cached index, no errors before indexing completes is still pending', () => {
+  const entry = { errorCount: 0, arrivedAtMs: 2000 };
+  assert.deepStrictEqual(decide({ isPersistentUserdir: true, entry, nowMs: 2000 }), pendingUntil(OPENED + CAP));
+});
+
+test('with a cached index, a document opened after the latest completion decides at once', () => {
+  const indexPhase = completeAt(500, 1);
+  const base = { isPersistentUserdir: true, indexPhase, completionCountAtOpen: 1 };
+  assert.deepStrictEqual(decide({ ...base, entry: { errorCount: 0, arrivedAtMs: 1500 }, nowMs: 1500 }), { kind: 'resolved' });
+  assert.deepStrictEqual(decide({ ...base, entry: { errorCount: 1, arrivedAtMs: 1500 }, nowMs: 3500 }), {
+    kind: 'unresolved',
+    reason: 'errors after indexing',
+  });
+});
+
+test('with a cached index, a document opened before completion asks for fresh diagnostics and decides on them', () => {
+  const indexPhase = completeAt(8000, 1);
+  const base = { isPersistentUserdir: true, indexPhase, completionCountAtOpen: 0 };
+  // An entry from before completion (from the stale index) does not decide.
+  const stale = { errorCount: 0, arrivedAtMs: 3000 };
+  assert.deepStrictEqual(decide({ ...base, entry: stale, nowMs: 8000 }), requestFresh);
+  const freshRequest = { completionCount: 1, requestedAtMs: 8000 };
+  assert.deepStrictEqual(decide({ ...base, entry: stale, freshRequest, nowMs: 8100 }), pendingUntil(OPENED + CAP));
+  // The first result after the request waits for the settle time, then decides.
+  const fresh = { errorCount: 0, arrivedAtMs: 8600 };
+  assert.deepStrictEqual(decide({ ...base, entry: fresh, freshRequest, nowMs: 8600 }), pendingUntil(8600 + SETTLE));
+  assert.deepStrictEqual(decide({ ...base, entry: fresh, freshRequest, nowMs: 10600 }), { kind: 'resolved' });
+  const broken = { errorCount: 2, arrivedAtMs: 8600 };
+  assert.deepStrictEqual(decide({ ...base, entry: broken, freshRequest, nowMs: 10600 }), {
+    kind: 'unresolved',
+    reason: 'errors after indexing',
+  });
+});
+
+test('with a cached index, a new completion asks for fresh diagnostics again', () => {
+  const freshRequest = { completionCount: 1, requestedAtMs: 8000 };
+  const entry = { errorCount: 0, arrivedAtMs: 8600 };
+  const base = { isPersistentUserdir: true, completionCountAtOpen: 0, entry, freshRequest };
+  assert.deepStrictEqual(decide({ ...base, indexPhase: indexing, nowMs: 11000 }), pendingUntil(OPENED + CAP));
+  assert.deepStrictEqual(decide({ ...base, indexPhase: completeAt(12000, 2), nowMs: 12000 }), requestFresh);
+});
+
+test('with a cached index, the limit decides on the latest result', () => {
+  const nowMs = OPENED + CAP;
+  assert.deepStrictEqual(decide({ isPersistentUserdir: true, entry: { errorCount: 0, arrivedAtMs: 2000 }, nowMs }), {
+    kind: 'resolved',
+  });
+  assert.deepStrictEqual(decide({ isPersistentUserdir: true, entry: { errorCount: 1, arrivedAtMs: 2000 }, nowMs }), {
+    kind: 'unresolved',
+    reason: 'wait limit',
+  });
+});
+
 test('selectEntryAfterRequest takes only an entry that arrived after the request', () => {
   const entry = { errorCount: 0, arrivedAtMs: 5000 };
   assert.strictEqual(selectEntryAfterRequest(entry, null), null);
@@ -175,6 +230,28 @@ test('the workspace/symbol signal still waits for running progress to end', asyn
   assert.deepStrictEqual(s.indexPhase, { kind: 'indexing' });
   s.handleProgress({ token: 'scan', value: { kind: 'end' } });
   assert.strictEqual(s.indexPhase.kind, 'complete');
+});
+
+test('requestFreshDiagnostics replaces the first character with itself, or adds and removes a newline', () => {
+  const s = createSession();
+  const notes = [];
+  s.client = { notify: (method, params) => notes.push(params) };
+  const doc = { uri: 'file:///p/A.java', version: 3, serverText: 'class A {}\n' };
+  s.requestFreshDiagnostics(doc);
+  assert.strictEqual(doc.version, 4);
+  assert.deepStrictEqual(notes[0].contentChanges, [
+    { range: { start: { line: 0, character: 0 }, end: { line: 0, character: 1 } }, text: 'c' },
+  ]);
+  const empty = { uri: 'file:///p/E.java', version: 1, serverText: '' };
+  s.requestFreshDiagnostics(empty);
+  assert.strictEqual(empty.version, 3);
+  assert.deepStrictEqual(
+    notes.slice(1).map((n) => n.contentChanges[0]),
+    [
+      { range: { start: { line: 0, character: 0 }, end: { line: 0, character: 0 } }, text: '\n' },
+      { range: { start: { line: 0, character: 0 }, end: { line: 1, character: 0 } }, text: '' },
+    ]
+  );
 });
 
 test('a diagnostics entry from before the document was opened is ignored', () => {
