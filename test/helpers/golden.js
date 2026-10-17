@@ -103,12 +103,15 @@ async function buildGolden({
   const cacheFile = path.join(GOLDEN_ROOT, 'cache', `${key}.json`);
   if (fs.existsSync(cacheFile)) return JSON.parse(fs.readFileSync(cacheFile, 'utf8'));
 
+  // `Internal error.` is how main's race shows when the file is left alone;
+  // such a build is never the reference, even if two of them agree.
+  const isCandidate = (b) => !b.some((e) => e.stderr.includes('Internal error.'));
   const build = () => runMainSequence({ mainScript, prepareCopy, files, flags, timeoutMs });
   const builds = isParallelBuild ? await Promise.all([build(), build()]) : [await build()];
-  let accepted = isParallelBuild && isSameBuild(builds[0], builds[1]) ? builds[0] : null;
+  let accepted = isParallelBuild && isCandidate(builds[0]) && isSameBuild(builds[0], builds[1]) ? builds[0] : null;
   while (!accepted && builds.length < maxBuilds) {
     const next = await build();
-    accepted = builds.find((b) => isSameBuild(b, next)) || null;
+    accepted = isCandidate(next) ? builds.find((b) => isSameBuild(b, next)) || null : null;
     builds.push(next);
   }
   if (!accepted) {
