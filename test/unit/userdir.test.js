@@ -165,7 +165,8 @@ test('a cache in use by a running owner gives a temporary userdir without waitin
   const lease = await withCache(t, env, () => lib.acquireUserdir('k1', 5000));
   removeTemporary(lease);
   assert.strictEqual(lease.kind, 'temporary');
-  assert.deepStrictEqual(Object.keys(lease).sort(), ['kind', 'userdir']);
+  assert.deepStrictEqual(Object.keys(lease).sort(), ['isCacheInUse', 'kind', 'userdir']);
+  assert.strictEqual(lease.isCacheInUse, true);
   assert.ok(Date.now() - startedAt < 1000);
 });
 
@@ -205,6 +206,7 @@ test('the wait for a shutting-down owner has a limit, then a temporary userdir',
   const lease = await withCache(t, env, () => lib.acquireUserdir('k1', 300));
   removeTemporary(lease);
   assert.strictEqual(lease.kind, 'temporary');
+  assert.strictEqual(lease.isCacheInUse, true, 'the previous server still had the cached userdir');
 });
 
 test('a lock whose owner and watchdog are both dead is broken and the userdir taken', async (t) => {
@@ -272,6 +274,90 @@ test('without process inspection, an unusable cache, or no hard links: a tempora
   } finally {
     fs.linkSync = original;
   }
+  assert.strictEqual(noInspection.isCacheInUse, false);
+});
+
+test('a small or unmeasured project gets a temporary userdir that is not marked in use', async (t) => {
+  const env = createIsolatedEnv();
+  t.after(() => env.cleanup());
+  const unmeasured = await withCache(t, env, () => lib.acquireUserdir('k1', 5000));
+  removeTemporary(unmeasured);
+  writeProjectRecord(env, 'k2', SMALL);
+  const small = await withCache(t, env, () => lib.acquireUserdir('k2', 5000));
+  removeTemporary(small);
+  for (const lease of [unmeasured, small]) {
+    assert.deepStrictEqual([lease.kind, lease.isCacheInUse], ['temporary', false]);
+  }
+});
+
+test('shouldRecordColdIndexing: only a fresh index that ran alone and did not lose the cache to another run', () => {
+  const temporary = { kind: 'temporary', userdir: '/t', isCacheInUse: false };
+  const record = (overrides) =>
+    lib.shouldRecordColdIndexing({ lease: temporary, isCacheAllowed: true, isAlone: true, ...overrides });
+  assert.strictEqual(record({}), true, 'alone');
+  assert.strictEqual(record({ isAlone: false }), false, 'another run of the root beside it');
+  assert.strictEqual(record({ lease: { ...temporary, isCacheInUse: true } }), false, 'the cached userdir was in use');
+  assert.strictEqual(record({ lease: { kind: 'persistent', userdir: '/c', ownerLock: {} } }), false, 'a cached index');
+  assert.strictEqual(record({ isCacheAllowed: false }), false, 'files from more than one root');
+});
+
+test('registerRun: of two overlapping runs both know; a run alone and runs after it ended do not count', async (t) => {
+  const env = createIsolatedEnv();
+  t.after(() => env.cleanup());
+  const root = path.join(env.dir, 'project');
+  fs.mkdirSync(root);
+  await withCache(t, env, async () => {
+    const a = await lib.registerRun(root);
+    assert.strictEqual(a.kind, 'registered');
+    assert.strictEqual(a.hasOtherRunAtStart, false);
+    const beforeB = Date.now() - 1;
+    assert.strictEqual(lib.hasRunAloneUntil(a, Date.now()), true, 'alone so far');
+    await new Promise((r) => setTimeout(r, 5));
+
+    const b = await lib.registerRun(root);
+    assert.strictEqual(b.hasOtherRunAtStart, true, 'b started while a ran');
+    assert.strictEqual(lib.hasRunAloneUntil(b, Date.now()), false);
+    assert.strictEqual(lib.hasRunAloneUntil(a, Date.now()), false, 'a learns of b');
+    assert.strictEqual(lib.hasRunAloneUntil(a, beforeB), true, 'b started after a had finished indexing');
+
+    // Another root does not count.
+    const other = path.join(env.dir, 'other');
+    fs.mkdirSync(other);
+    const c = await lib.registerRun(other);
+    assert.strictEqual(c.hasOtherRunAtStart, false);
+
+    for (const r of [a, b, c]) lib.unregisterRun(r);
+    const dir = lib.resolveRunRegistryDir(env.KIRO_JAVA_FORMAT_CACHE, root);
+    assert.deepStrictEqual(fs.readdirSync(dir), [], 'nothing is left after unregistering');
+    const d = await lib.registerRun(root);
+    assert.strictEqual(d.hasOtherRunAtStart, false, 'runs that ended do not count');
+    lib.unregisterRun(d);
+  });
+});
+
+test('registerRun: a dead run is removed, one that cannot be told counts, no registration is not alone', async (t) => {
+  const env = createIsolatedEnv();
+  t.after(() => env.cleanup());
+  const root = path.join(env.dir, 'project');
+  fs.mkdirSync(root);
+  await withCache(t, env, async () => {
+    const dir = lib.resolveRunRegistryDir(env.KIRO_JAVA_FORMAT_CACHE, root);
+    fs.mkdirSync(dir, { recursive: true });
+    const deadLock = path.join(dir, '1-dead.lock');
+    fs.writeFileSync(deadLock, JSON.stringify({ pid: await exitedPid(), nonce: 'n', createdAt: Date.now() - 5000 }));
+    fs.writeFileSync(path.join(dir, '1-dead.beside'), JSON.stringify({ atMs: 1 }));
+    fs.writeFileSync(path.join(dir, '2-orphan.beside'), JSON.stringify({ atMs: 1 }));
+    const a = await lib.registerRun(root);
+    assert.strictEqual(a.hasOtherRunAtStart, false, 'the dead run does not count');
+    assert.deepStrictEqual(fs.readdirSync(dir), [path.basename(a.lockPath)], 'its files and the orphan are removed');
+
+    const unknown = async () => ({ isAvailable: false, reason: 'test' });
+    const b = await lib.registerRun(root, { inspect: unknown });
+    assert.strictEqual(b.hasOtherRunAtStart, true, 'a that cannot be inspected may be indexing');
+    for (const r of [a, b]) lib.unregisterRun(r);
+
+    assert.strictEqual(lib.hasRunAloneUntil({ kind: 'unregistered', reason: 'test' }, Date.now()), false);
+  });
 });
 
 test('prepareUserdirForStart looks at processes only when a previous run left a trace', async () => {

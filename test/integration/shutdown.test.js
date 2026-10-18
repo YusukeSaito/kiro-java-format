@@ -57,8 +57,11 @@ async function runAndEnd(t, { args = [], endWith = null }) {
     t.diagnostic(`left after ${Date.now() - endedAt}ms: ${left.length}`);
     assert.deepStrictEqual(left, [], 'no process of the run is left');
     const leftovers = listLeftovers(env);
-    // A CLI killed with SIGKILL cannot release its file lock; the next run breaks it as stale.
-    if (endWith === 'SIGKILL') leftovers.fileLocks = [];
+    // A CLI killed with SIGKILL cannot release its file lock and registration; the next run breaks them as stale.
+    if (endWith === 'SIGKILL') {
+      leftovers.fileLocks = [];
+      leftovers.runRegistrations = [];
+    }
     assert.deepStrictEqual(leftovers, NO_LEFTOVERS, 'no temporary userdir or lock is left');
     for (const d of decoys) assert.ok(isAlive(d.pid), `decoy ${d.pid} is alive`);
     return result;

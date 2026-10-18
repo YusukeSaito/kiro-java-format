@@ -67,7 +67,12 @@ test('after SIGKILL of the CLI, the watchdog stops the server and releases the c
   const { env, during } = await killMidRun(t, () => ({}), { isLarge: true });
   assert.strictEqual(during.ownerLocks.length, 1, 'the run owned the cached userdir');
   assert.strictEqual(during.netbeansLocks.length, 1, 'the server held its lock');
-  assert.deepStrictEqual(listLeftovers(env), { ...NO_LEFTOVERS, fileLocks: during.fileLocks });
+  // A CLI killed with SIGKILL cannot remove its file lock and registration; later runs break them as stale.
+  assert.deepStrictEqual(listLeftovers(env), {
+    ...NO_LEFTOVERS,
+    fileLocks: during.fileLocks,
+    runRegistrations: during.runRegistrations,
+  });
   assert.strictEqual(listCachedUserdirs(env).length, 1, 'the cached userdir itself stays');
 });
 
@@ -106,6 +111,34 @@ test('a small project runs in a temporary userdir, is recorded, and leaves no ca
     assert.strictEqual(records[0].record.coldIndexing.kind, 'complete');
     assert.ok(records[0].record.coldIndexing.durationMs < 10000);
   }
+});
+
+test('runs of one root side by side record nothing; a run alone then records', async (t) => {
+  const env = createIsolatedEnv();
+  t.after(() => {
+    killOwnPids(listProcessesWithToken(env.dir).map((p) => p.pid));
+    env.cleanup();
+  });
+  const files = writeJavaFiles(env.dir, 2);
+  // Each server waits 1 s before listening, so the two runs overlap.
+  const fakeEnv = buildFakeEnv(env, { FAKE_START_DELAY_MS: '1000' });
+  const runs = await Promise.all(
+    files.map((f) => startCli(script, ['-v', f], { cwd: env.dir, env: fakeEnv }).done)
+  );
+  for (const r of runs) {
+    assert.strictEqual(r.code, 0, r.stderr);
+    assert.match(r.stderr, /project record: not saved; another run of this root may have run beside this one/);
+  }
+  assert.deepStrictEqual(listProjectRecords(env), [], 'nothing was recorded');
+  assert.deepStrictEqual(await waitForNoProcessesWithToken(env.dir, SETTLE_MS), []);
+
+  const alone = await startCli(script, files, { cwd: env.dir, env: buildFakeEnv(env) }).done;
+  assert.strictEqual(alone.code, 0, alone.stderr);
+  const records = listProjectRecords(env);
+  assert.strictEqual(records.length, 1);
+  assert.strictEqual(records[0].record.coldIndexing.kind, 'complete');
+  assert.deepStrictEqual(await waitForNoProcessesWithToken(env.dir, SETTLE_MS), []);
+  assert.deepStrictEqual(listLeftovers(env), NO_LEFTOVERS);
 });
 
 test('a large project: after a normal run the watchdog releases the cached userdir once the server is gone', async (t) => {

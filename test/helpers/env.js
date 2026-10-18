@@ -30,13 +30,15 @@ function createIsolatedEnv(prefix = 'kjf-t-') {
 
 /**
  * What a finished run must not leave in the environment: temporary userdirs,
- * owner locks, NetBeans locks in cached userdirs, and file locks.
+ * owner locks, NetBeans locks in cached userdirs, file locks, and run
+ * registrations.
  */
 function listLeftovers(env) {
   const temporaryUserdirs = fs.readdirSync(env.dir).filter((n) => n.startsWith('kiro-java-format-userdir-'));
   const ownerLocks = [];
   const netbeansLocks = [];
   let fileLocks = [];
+  const runRegistrations = [];
   const cache = env.KIRO_JAVA_FORMAT_CACHE;
   if (fs.existsSync(cache) && fs.statSync(cache).isDirectory()) {
     for (const name of fs.readdirSync(cache)) {
@@ -44,14 +46,20 @@ function listLeftovers(env) {
         fileLocks = fs.readdirSync(path.join(cache, name));
         continue;
       }
+      if (name === 'runs') {
+        for (const root of fs.readdirSync(path.join(cache, name))) {
+          runRegistrations.push(...fs.readdirSync(path.join(cache, name, root)));
+        }
+        continue;
+      }
       if (fs.existsSync(path.join(cache, name, 'owner.lock'))) ownerLocks.push(name);
       if (fs.existsSync(path.join(cache, name, 'userdir', 'lock'))) netbeansLocks.push(name);
     }
   }
-  return { temporaryUserdirs, ownerLocks, netbeansLocks, fileLocks };
+  return { temporaryUserdirs, ownerLocks, netbeansLocks, fileLocks, runRegistrations };
 }
 
-const NO_LEFTOVERS = { temporaryUserdirs: [], ownerLocks: [], netbeansLocks: [], fileLocks: [] };
+const NO_LEFTOVERS = { temporaryUserdirs: [], ownerLocks: [], netbeansLocks: [], fileLocks: [], runRegistrations: [] };
 
 /** The project records (project.json) in the environment's cache: [{ key, record }]. */
 function listProjectRecords(env) {

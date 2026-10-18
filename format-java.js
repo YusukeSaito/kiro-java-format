@@ -1047,13 +1047,18 @@ function releaseHeldFileLocks() {
 }
 
 /**
- * Get ready to exit. File locks are released. On an abnormal exit (fatal
+ * Get ready to exit. File locks and the run's registration (registerRun) are
+ * released. On an abnormal exit (fatal
  * error, signal) every server still running is sent SIGTERM; after a normal
  * run they were already told to exit. A server whose watchdog could not be
  * started is cleaned up here and now.
  */
 async function prepareForExit({ isAbnormal }) {
   releaseHeldFileLocks();
+  if (currentRunRegistration) {
+    unregisterRun(currentRunRegistration);
+    currentRunRegistration = null;
+  }
   for (const server of startedServers) {
     server.markOwnerLockReleasing();
     if (isAbnormal) signalOwnServer(server.proc, 'SIGTERM');
@@ -1383,8 +1388,14 @@ function hasMixedProjectRoots(files, explicitRoot) {
   return files.some((f) => detectRoot(f, null) !== root);
 }
 
-function createTemporaryUserdir() {
-  return { kind: 'temporary', userdir: fs.mkdtempSync(path.join(os.tmpdir(), 'kiro-java-format-userdir-')) };
+/**
+ * A new temporary userdir lease. `isCacheInUse` is set when the project's
+ * cached userdir was taken by another run: this run then indexes beside that
+ * one, so its indexing time does not count (see shouldRecordColdIndexing).
+ */
+function createTemporaryUserdir({ isCacheInUse = false } = {}) {
+  const userdir = fs.mkdtempSync(path.join(os.tmpdir(), 'kiro-java-format-userdir-'));
+  return { kind: 'temporary', userdir, isCacheInUse };
 }
 
 /**
@@ -1476,6 +1487,124 @@ function saveColdIndexingRecord(key, { root, extPath, jdkHome }, observation) {
   }
 }
 
+/**
+ * Whether a segment's indexing time may be stored as the project's time on a
+ * fresh index. Only a run alone counts: JVMs indexing side by side slow each
+ * other down, and one such run could make a small project look large for
+ * good (a cached run does not measure, so nothing would set it back). So not
+ * recorded are runs on a cached index, runs that got a temporary userdir
+ * because the cached one was in use, runs with files from other roots, and
+ * runs not known to have been alone (`isAlone`, see hasRunAloneUntil).
+ */
+function shouldRecordColdIndexing({ lease, isCacheAllowed, isAlone }) {
+  return lease.kind === 'temporary' && !lease.isCacheInUse && isCacheAllowed && isAlone;
+}
+
+/**
+ * Where the runs of one project root (by real path) register, so a run can
+ * tell whether another run on the same root ran beside it.
+ */
+function resolveRunRegistryDir(cacheRoot, rootDir) {
+  const key = crypto.createHash('sha256').update(resolveRealPath(rootDir)).digest('hex').slice(0, 16);
+  return path.join(cacheRoot, 'runs', key);
+}
+
+/** This process's registration, so the exit paths can remove it. */
+let currentRunRegistration = null;
+
+/**
+ * Register this run of `rootDir` (a lock file of its own in the root's
+ * registry directory). A run that starts while others are registered writes
+ * the time into each one's `.beside` file (the first such time is kept), and
+ * notes `hasOtherRunAtStart` itself. So of two runs that overlap, the later
+ * one knows from the start and the earlier one from its `.beside` file.
+ * Registrations of runs that are gone are removed on the way.
+ *
+ * Returns `{ kind: 'registered', lockPath, nonce, besidePath, hasOtherRunAtStart }`,
+ * or `{ kind: 'unregistered', reason }` when none can be made here.
+ */
+async function registerRun(rootDir, { inspect = inspectToolProcess } = {}) {
+  let dir;
+  try {
+    dir = ensurePrivateDir(resolveRunRegistryDir(resolveCurrentCacheRoot(), rootDir));
+  } catch (err) {
+    return { kind: 'unregistered', reason: err.message };
+  }
+  const name = `${process.pid}-${crypto.randomBytes(6).toString('hex')}`;
+  const lockPath = path.join(dir, `${name}.lock`);
+  const r = acquireLockFile(lockPath, {});
+  if (r.kind === 'unusable') return { kind: 'unregistered', reason: r.reason };
+  if (r.kind === 'busy') return { kind: 'unregistered', reason: 'the registration name is taken' };
+
+  let hasOtherRunAtStart = false;
+  let names;
+  try {
+    names = fs.readdirSync(dir);
+  } catch (err) {
+    releaseLockFile(lockPath, r.nonce);
+    return { kind: 'unregistered', reason: err.message };
+  }
+  for (const other of names) {
+    const otherPath = path.join(dir, other);
+    if (other.endsWith('.beside')) {
+      // A .beside file outlives its run only when written as the run ended.
+      if (!names.includes(`${other.slice(0, -'.beside'.length)}.lock`)) removeFileQuietly(otherPath);
+      continue;
+    }
+    if (!other.endsWith('.lock') || otherPath === lockPath) continue;
+    const otherBesidePath = otherPath.replace(/\.lock$/, '.beside');
+    let isGone;
+    try {
+      const read = readLockRecord(otherPath);
+      const isStale = read.kind !== 'missing' && (await isLockStale(read, Date.now(), { inspect }));
+      isGone = read.kind === 'missing' || (isStale && breakStaleLock(otherPath, read));
+    } catch {
+      isGone = false;
+    }
+    if (isGone) {
+      removeFileQuietly(otherBesidePath);
+      continue;
+    }
+    // Alive, or it cannot be told (an unreadable registration included):
+    // either way it may be indexing too.
+    hasOtherRunAtStart = true;
+    try {
+      fs.writeFileSync(otherBesidePath, JSON.stringify({ atMs: Date.now() }), { flag: 'wx', mode: 0o600 });
+    } catch {
+      /* an earlier time is already there, or the other run cannot be told */
+    }
+  }
+  const besidePath = path.join(dir, `${name}.beside`);
+  return { kind: 'registered', lockPath, nonce: r.nonce, besidePath, hasOtherRunAtStart };
+}
+
+/**
+ * Whether the registered run is known to have had no other run of its root
+ * beside it from its start up to `untilMs`. False when that cannot be told
+ * (no registration, or a .beside file that cannot be read).
+ */
+function hasRunAloneUntil(registration, untilMs) {
+  if (registration.kind !== 'registered' || registration.hasOtherRunAtStart) return false;
+  let text;
+  try {
+    text = fs.readFileSync(registration.besidePath, 'utf8');
+  } catch (err) {
+    return err.code === 'ENOENT';
+  }
+  try {
+    const { atMs } = JSON.parse(text);
+    return Number.isFinite(atMs) && atMs > untilMs;
+  } catch {
+    return false;
+  }
+}
+
+function unregisterRun(registration) {
+  if (registration.kind !== 'registered') return;
+  removeFileQuietly(registration.besidePath);
+  releaseLockFile(registration.lockPath, registration.nonce);
+}
+
 /** How often to look again while a previous run of this project shuts its server down. */
 const OWNER_POLL_MS = 100;
 
@@ -1513,8 +1642,9 @@ async function prepareUserdirForStart(userdir, { hasStaleOwner }, deps = {}) {
  * is large enough to gain from it (shouldUseCachedIndex) and this run can own
  * it, else a new temporary one. Returns
  * `{ kind: 'persistent', userdir, ownerLock: { path, nonce } }` or
- * `{ kind: 'temporary', userdir }`. A project not measured yet (no record, or
- * one that cannot be read) gets a temporary userdir, whose run measures it.
+ * `{ kind: 'temporary', userdir, isCacheInUse }`. A project not measured yet
+ * (no record, or one that cannot be read) gets a temporary userdir, whose run
+ * measures it.
  *
  * A cached userdir has one owner at a time (owner.lock): two servers on one
  * userdir fight over its documents and index. Another run that is still
@@ -1586,7 +1716,7 @@ async function acquireUserdir(key, timeoutMs, deps = {}) {
       const isOwnerAlive = await isAliveOrUnknown(record.pid);
       if (isOwnerAlive && record.state === 'running') {
         vlog('userdir: in use by another run; using a temporary one');
-        return createTemporaryUserdir();
+        return createTemporaryUserdir({ isCacheInUse: true });
       }
       // With no watchdog recorded (it could not be started, or the record was
       // not updated), nobody but the owner will release this lock, so a dead
@@ -1604,7 +1734,7 @@ async function acquireUserdir(key, timeoutMs, deps = {}) {
     // The previous run is shutting its server down.
     if (hasDeadlinePassed(deadlineMs)) {
       vlog('userdir: the previous server did not finish in time; using a temporary one');
-      return createTemporaryUserdir();
+      return createTemporaryUserdir({ isCacheInUse: true });
     }
     await waitMs(OWNER_POLL_MS);
   }
@@ -1922,6 +2052,11 @@ class ServerSession {
       return { kind: 'complete', durationMs: Math.max(0, this.firstIndexCompletedAtMs - from) };
     }
     return { kind: 'incomplete', minimumMs: Math.max(0, nowMs - from) };
+  }
+
+  /** When the indexing measured by measureIndexingTime(nowMs) ended: its first completion, else `nowMs`. */
+  resolveIndexingEndMs(nowMs) {
+    return this.firstIndexCompletedAtMs !== null ? this.firstIndexCompletedAtMs : nowMs;
   }
 
   handleProgress(params) {
@@ -2391,6 +2526,9 @@ async function formatFiles(files, context) {
   const isCacheAllowed = !hasMixedProjectRoots(files, opts.root);
   if (!isCacheAllowed) vlog('files from more than one project root; using a temporary userdir');
   const projectKey = computeProjectKey(rootDir, extPath, jdkHome);
+  const registration = await registerRun(rootDir);
+  if (registration.kind === 'unregistered') vlog('run registry: not registered:', registration.reason);
+  currentRunRegistration = registration;
   let exitCode = 0;
   try {
     const segments = splitIntoSegments(files);
@@ -2401,25 +2539,35 @@ async function formatFiles(files, context) {
       const lease =
         i === 0 && isCacheAllowed ? await acquireUserdir(projectKey, opts.timeoutMs) : createTemporaryUserdir();
       let indexing = null;
+      let indexingEndedAtMs = null;
       await runWithServerSession(context, lease, async (session) => {
         for (const file of segment) {
           notStarted.shift();
           exitCode = Math.max(exitCode, await formatOneFile(session, file, context.opts));
         }
-        indexing = session.measureIndexingTime(Date.now());
+        const nowMs = Date.now();
+        indexing = session.measureIndexingTime(nowMs);
+        indexingEndedAtMs = session.resolveIndexingEndMs(nowMs);
       });
-      // A temporary userdir starts from an empty index, so its run tells how
-      // long this project takes to index. A cached one does not: it starts
-      // warm. Files from other roots are indexed too, so such a run does not
-      // count either.
-      if (lease.kind === 'temporary' && isCacheAllowed) {
+      // A temporary userdir starts from an empty index, so a run in one tells
+      // how long this project takes to index, when nothing else ran beside it.
+      const isAlone = hasRunAloneUntil(registration, indexingEndedAtMs);
+      if (shouldRecordColdIndexing({ lease, isCacheAllowed, isAlone })) {
         saveColdIndexingRecord(projectKey, { root: rootDir, extPath, jdkHome }, indexing);
+      } else if (lease.kind === 'temporary' && isCacheAllowed) {
+        vlog(
+          'project record: not saved;',
+          lease.isCacheInUse ? 'the cached index was in use' : 'another run of this root may have run beside this one'
+        );
       }
     }
   } catch (err) {
     if (!(err instanceof ServerExitedError)) throw err;
     for (const file of notStarted) console.error(`error: ${file}: ${err.message}`);
     return 1;
+  } finally {
+    unregisterRun(registration);
+    currentRunRegistration = null;
   }
   return exitCode;
 }
@@ -2526,4 +2674,9 @@ module.exports = {
   resolveColdIndexingRecord,
   readProjectRecord,
   saveColdIndexingRecord,
+  shouldRecordColdIndexing,
+  resolveRunRegistryDir,
+  registerRun,
+  hasRunAloneUntil,
+  unregisterRun,
 };

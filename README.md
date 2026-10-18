@@ -167,8 +167,13 @@ find src -name '*.java' -print0 | xargs -0 kiro-java-format --check
 
 The tool keeps a small record per project (project root + extension + JDK): how long its
 index took to build from scratch. A project that took 10 seconds or more also gets its
-index cached, about 100 MB per project; smaller projects never get one. The first run of
-a project always builds the index from scratch to measure it.
+index cached, about 100 MB per project; smaller projects never get one. Until a project
+has been measured, every run builds its index from scratch.
+
+Only a run that had the project to itself is measured, since indexes built side by side
+slow each other down. A run is not measured when another invocation on the same project
+root was running while it indexed, or when it built a temporary index because another
+invocation was using the cached one.
 
 | OS | Location |
 | --- | --- |
