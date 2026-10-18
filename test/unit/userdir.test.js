@@ -223,6 +223,20 @@ test('a lock whose owner and watchdog are both dead is broken and the userdir ta
   assert.notStrictEqual(lib.readLockRecord(lease.ownerLock.path).record.nonce, 'n');
 });
 
+test('a dead owner with no watchdog recorded is broken at once: nobody else would release it', async (t) => {
+  const env = createIsolatedEnv();
+  t.after(() => env.cleanup());
+  const dead = await exitedPid();
+  for (const server of [undefined, { watchdogPid: null }]) {
+    writeOwnerLock(env, 'k1', { pid: dead, nonce: 'n', createdAt: Date.now() - 5000, state: 'releasing', server });
+    const startedAt = Date.now();
+    const lease = await withCache(t, env, () => lib.acquireUserdir('k1', 5000));
+    assert.strictEqual(lease.kind, 'persistent', JSON.stringify(server));
+    assert.ok(Date.now() - startedAt < 2500, 'did not wait for the limit');
+    lib.releaseLockFile(lease.ownerLock.path, lease.ownerLock.nonce);
+  }
+});
+
 test('without process inspection, an unusable cache, or no hard links: a temporary userdir', async (t) => {
   const env = createIsolatedEnv();
   t.after(() => env.cleanup());

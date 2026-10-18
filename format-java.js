@@ -717,7 +717,8 @@ function hasToolScriptArgument(commandLine) {
  * Whether `pid` is alive and, when asked, still runs this tool.
  *
  * Returns `{ isAvailable: false, reason }` when it cannot be told, otherwise
- * `{ isAvailable: true, isAlive }`. The command line is checked only when
+ * `{ isAvailable: true, isAlive }`, where `isAlive` means alive and (when the
+ * command line is checked) running this tool. The command line is checked only when
  * `shouldVerifyCommandLine` is set: a pid in a lock older than a moment may
  * have been recycled for an unrelated process.
  */
@@ -945,23 +946,24 @@ async function terminateServerProcesses({ pgid, launcherPid, userdir }, graceMs,
     if (isOwnGroup) trySignal(-pgid, signal);
     else for (const p of processes) trySignal(p.pid, signal);
   };
+  // Returns the last result of `find` as is: `{ isAvailable: false }` (cannot
+  // be told) is kept apart from "gone", so it never counts as terminated.
   const waitUntilGone = async (limitMs) => {
     const deadline = Date.now() + limitMs;
     for (;;) {
       await wait(100);
       const r = await find(userdir);
-      if (!r.isAvailable) return null;
-      if (r.processes.length === 0 || hasDeadlinePassed(deadline)) return r.processes;
+      if (!r.isAvailable || r.processes.length === 0 || hasDeadlinePassed(deadline)) return r;
     }
   };
 
   await sendAll(first.processes, 'SIGTERM');
-  let left = await waitUntilGone(graceMs);
-  if (left && left.length > 0) {
-    await sendAll(left, 'SIGKILL');
-    left = await waitUntilGone(2000);
+  let r = await waitUntilGone(graceMs);
+  if (r.isAvailable && r.processes.length > 0) {
+    await sendAll(r.processes, 'SIGKILL');
+    r = await waitUntilGone(2000);
   }
-  return { isTerminated: Array.isArray(left) && left.length === 0 };
+  return { isTerminated: r.isAvailable && r.processes.length === 0 };
 }
 
 // ---------------------------------------------------------------------------
@@ -1575,8 +1577,8 @@ async function acquireUserdir(key, timeoutMs, deps = {}) {
     if (read.kind === 'parsed') {
       const record = read.record;
       const shouldVerifyCommandLine = !(Date.now() - record.createdAt < LOCK_PID_CHECK_AGE_MS);
+      // A pid that cannot be inspected counts as alive, so a live holder's lock is never broken.
       const isAliveOrUnknown = async (pid) => {
-        if (!Number.isInteger(pid)) return false;
         const p = await inspectToolProcess(pid, { shouldVerifyCommandLine });
         return !p.isAvailable || p.isAlive;
       };
@@ -1585,7 +1587,11 @@ async function acquireUserdir(key, timeoutMs, deps = {}) {
         vlog('userdir: in use by another run; using a temporary one');
         return createTemporaryUserdir();
       }
-      const isWatchdogAlive = await isAliveOrUnknown(record.server && record.server.watchdogPid);
+      // With no watchdog recorded (it could not be started, or the record was
+      // not updated), nobody but the owner will release this lock, so a dead
+      // owner alone makes it stale.
+      const hasWatchdog = Boolean(record.server && Number.isInteger(record.server.watchdogPid));
+      const isWatchdogAlive = hasWatchdog && (await isAliveOrUnknown(record.server.watchdogPid));
       if (!isOwnerAlive && !isWatchdogAlive && breakStaleLock(lockPath, read)) {
         hasStaleOwner = true;
         continue;
@@ -1723,10 +1729,8 @@ class ServerSession {
     // When the workspace was opened, and when indexing first completed (null: not yet).
     this.initializedAtMs = this.startedAtMs;
     this.firstIndexCompletedAtMs = null;
-    // A reused (cached) index can report a file clean before the index is
-    // brought up to date, so with one only results after indexing count.
-    this.isPersistentUserdir = false;
-    // `{ path, nonce }` of the cached userdir's owner lock, when this server uses one.
+    // `{ path, nonce }` of the cached userdir's owner lock, when this server
+    // uses one (see isPersistentUserdir).
     this.ownerLock = null;
     // 'diagnostics' (uri), 'indexPhase', 'exit'
     this.events = new EventEmitter();
@@ -1742,6 +1746,15 @@ class ServerSession {
   }
 
   /**
+   * Whether this server reuses a cached index (only a cached userdir has an
+   * owner lock). Such an index can report a file clean before it is brought
+   * up to date, so with one only results after indexing count.
+   */
+  get isPersistentUserdir() {
+    return this.ownerLock !== null;
+  }
+
+  /**
    * Start nbcode, connect to it and initialize the workspace at rootDir. Each
    * of the three waits may take up to `timeoutMs`; past that, TimeoutError.
    *
@@ -1754,9 +1767,11 @@ class ServerSession {
     const { proc, listening } = startServer(nbcodePath, jdkHome, userdir);
     const session = new ServerSession(proc);
     session.timeoutMs = timeoutMs;
-    session.isPersistentUserdir = lease.kind === 'persistent';
     session.ownerLock = ownerLock;
     const isPosix = process.platform !== 'win32';
+    // Sent to the watchdog as JSON. isTemporaryUserdir and ownerLockPath say
+    // the same thing (a persistent userdir always has an owner lock); both
+    // are set here from the lease, so they cannot disagree.
     session.watchdogConfig = {
       pgid: isPosix ? proc.pid : null,
       launcherPid: proc.pid,
@@ -2242,16 +2257,26 @@ function isServerUnusable(err) {
  *
  * One bad file must not abandon the rest: a run over a whole tree would then
  * leave some files formatted and the remainder untouched, with no way to tell
- * where it stopped. So failures are reported here and not thrown.
+ * where it stopped. So a failure of this file is reported here and returns 1,
+ * except for two that are thrown:
+ * - ServerExitedError, after this file's line is printed: no later file can
+ *   be formatted either, and formatFiles reports each of them with it.
+ * - a failure to read the file, before anything is printed for it; it reaches
+ *   main, which ends the run with fail(), as earlier versions did.
  *
  * The file is read, formatted and written under its lock, so another run of
  * this tool on the same file waits instead of reading a half-written file.
  */
 function formatOneFile(session, file, opts) {
-  return runWithFileLock(file, opts.timeoutMs, () => formatLockedFile(session, file, opts));
+  return runWithFileLock(file, opts.timeoutMs, () => organizeAndFormatFile(session, file, opts));
 }
 
-async function formatLockedFile(session, file, opts) {
+/**
+ * The body of formatOneFile, run under the file's lock when one could be
+ * taken. Without the lock (none could be made, or the wait hit its limit),
+ * writeFileIfUnchanged still guards the write.
+ */
+async function organizeAndFormatFile(session, file, opts) {
   const uri = pathToFileURL(file).href;
   const original = fs.readFileSync(file, 'utf8');
   let current = original;
@@ -2345,7 +2370,8 @@ function splitIntoSegments(files) {
 /**
  * Format `files` in order and return the exit code. Each segment (see
  * splitIntoSegments) runs in its own language server. Throws when a server
- * cannot be started; failures of single files are reported by formatOneFile.
+ * cannot be started or a file cannot be read; other failures of single files
+ * are reported by formatOneFile.
  *
  * When a server exits in the middle, every file it did not get to is
  * reported with the same error at once, and no further server is started.
