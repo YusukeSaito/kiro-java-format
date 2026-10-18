@@ -992,10 +992,11 @@ async function cleanUpAfterServer(config) {
 
 /**
  * Start the watchdog of a language server just spawned: a detached node
- * process that waits for this process to end, then runs cleanUpAfterServer.
- * It learns of the end from its stdin reaching EOF, which the OS delivers
- * however this process ends (normal exit, exception, signal, SIGKILL), so
- * shutting the JVM down and deleting the userdir never delays the user.
+ * process that waits until the server is closed or this process ends, then
+ * runs cleanUpAfterServer. It learns of either from its stdin reaching EOF:
+ * ServerSession.close ends it, and the OS closes it however this process
+ * ends (normal exit, exception, signal, SIGKILL). Shutting the JVM down and
+ * deleting the userdir therefore never delay the user.
  * Returns null when it cannot be started; the caller then cleans up itself.
  */
 function spawnServerWatchdog(config, onFailure) {
@@ -2231,6 +2232,10 @@ class ServerSession {
     }
     this.markOwnerLockReleasing();
     this.socket.end();
+    // Let the watchdog clean up now rather than when this process exits, so
+    // with several segments the first one's owner lock is not held in
+    // `releasing` while the later ones run.
+    if (this.watchdog) this.watchdog.stdin.end();
   }
 
   /**

@@ -116,3 +116,33 @@ test('a large project: after a normal run the watchdog releases the cached userd
   const { coldIndexing } = listProjectRecords(env)[0].record;
   assert.deepStrictEqual(coldIndexing, { kind: 'complete', durationMs: 60000 }, 'a cached run does not record');
 });
+
+test('with a repeated file, the cached userdir is released while the later segment still runs', async (t) => {
+  const env = createIsolatedEnv();
+  t.after(() => {
+    killOwnPids(listProcessesWithToken(env.dir).map((p) => p.pid));
+    env.cleanup();
+  });
+  const files = writeJavaFiles(env.dir, 2);
+  await recordAsLarge(env, files);
+  // Each server waits 4 s before listening, so the second segment (a
+  // temporary userdir) runs long enough to look at the first one's lock.
+  const run = startCli(script, [files[0], files[1], files[0]], {
+    cwd: env.dir,
+    env: buildFakeEnv(env, { FAKE_START_DELAY_MS: '4000' }),
+  });
+  let isReleasedDuringRun = false;
+  for (let i = 0; i < 300 && run.child.exitCode === null; i++) {
+    const left = listLeftovers(env);
+    if (left.temporaryUserdirs.length === 1 && left.ownerLocks.length === 0) {
+      isReleasedDuringRun = run.child.exitCode === null;
+      break;
+    }
+    await new Promise((r) => setTimeout(r, 50));
+  }
+  const r = await run.done;
+  assert.strictEqual(r.code, 0, r.stderr);
+  assert.ok(isReleasedDuringRun, 'the owner lock was released before the CLI exited');
+  assert.deepStrictEqual(await waitForNoProcessesWithToken(env.dir, SETTLE_MS), []);
+  assert.deepStrictEqual(listLeftovers(env), NO_LEFTOVERS);
+});
