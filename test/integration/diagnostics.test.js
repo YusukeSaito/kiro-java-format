@@ -246,4 +246,32 @@ describe('diagnostics', { skip }, () => {
     }
     assert.deepStrictEqual(problems, []);
   });
+
+  it('a batch with a cached index (cold, then warm) matches the golden', async (t) => {
+    const golden = await getGolden([]);
+    const env = createIsolatedEnv();
+    const problems = [];
+    try {
+      const copy = copyFixture('minimal-maven', path.join(env.dir, 'project'));
+      // A --check run writes nothing and records the project; then make it look large.
+      const measure = await runCli(script, ['--check', path.join(copy, A)], { cwd: copy, env: env.buildEnv() });
+      assert.strictEqual(measure.code, 1, measure.stderr);
+      markRecordedProjectsLarge(env);
+      const times = [];
+      for (const label of ['cold', 'warm']) {
+        copyFixture('minimal-maven', copy);
+        const r = await runCli(script, ['-v', ...FILES.map((f) => path.join(copy, f))], {
+          cwd: copy,
+          env: env.buildEnv(),
+        });
+        assert.match(r.stderr, /userdir \(cached\):/, `${label}: the run used the cached userdir`);
+        problems.push(...compareWithGolden(`cached ${label}`, expectedForCall(golden, FILES), r, copy, { isVerbose: true }));
+        times.push(`${label} ${r.elapsedMs}ms`);
+      }
+      t.diagnostic(times.join(', '));
+    } finally {
+      await finishEnv(env);
+    }
+    assert.deepStrictEqual(problems, []);
+  });
 });

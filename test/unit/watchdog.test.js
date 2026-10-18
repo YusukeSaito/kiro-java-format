@@ -41,7 +41,7 @@ async function recordAsLarge(env, files) {
   markRecordedProjectsLarge(env);
 }
 
-async function killMidRun(t, extraEnv, { isLarge = false } = {}) {
+async function killMidRun(t, extraEnv, { isLarge = false, signal = 'SIGKILL' } = {}) {
   const env = createIsolatedEnv();
   t.after(() => {
     killOwnPids(listProcessesWithToken(env.dir).map((p) => p.pid));
@@ -56,9 +56,9 @@ async function killMidRun(t, extraEnv, { isLarge = false } = {}) {
   await waitForServer(env.dir);
   await new Promise((r) => setTimeout(r, 1000));
   const during = listLeftovers(env);
-  run.child.kill('SIGKILL');
+  run.child.kill(signal);
   const r = await run.done;
-  assert.strictEqual(r.signal, 'SIGKILL');
+  assert.strictEqual(r.signal, signal);
   assert.deepStrictEqual(await waitForNoProcessesWithToken(env.dir, SETTLE_MS), []);
   return { env, during };
 }
@@ -70,6 +70,15 @@ test('after SIGKILL of the CLI, the watchdog stops the server and releases the c
   assert.deepStrictEqual(listLeftovers(env), { ...NO_LEFTOVERS, fileLocks: during.fileLocks });
   assert.strictEqual(listCachedUserdirs(env).length, 1, 'the cached userdir itself stays');
 });
+
+for (const signal of ['SIGINT', 'SIGTERM']) {
+  test(`after ${signal} to the CLI, the server stops and the cached userdir is released`, async (t) => {
+    const { env, during } = await killMidRun(t, () => ({}), { isLarge: true, signal });
+    assert.strictEqual(during.ownerLocks.length, 1, 'the run owned the cached userdir');
+    assert.deepStrictEqual(listLeftovers(env), NO_LEFTOVERS);
+    assert.strictEqual(listCachedUserdirs(env).length, 1, 'the cached userdir itself stays');
+  });
+}
 
 test('after SIGKILL of the CLI, the watchdog removes a temporary userdir', async (t) => {
   const { env, during } = await killMidRun(t, () => ({}));
