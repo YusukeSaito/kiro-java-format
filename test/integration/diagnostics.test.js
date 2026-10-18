@@ -135,9 +135,15 @@ describe('diagnostics', { skip }, () => {
       assert.deepStrictEqual(compareWithGolden('-v [E]', expectedForCall(golden, [E]), v, copy2, { isVerbose: true }), []);
       const timeline = extractTimeline(v.stderr);
       t.diagnostic(`-v [E] took ${v.elapsedMs}ms\n${normalizeOutput(timeline, [copy2])}`);
-      const m = timeline.match(/E\.java: errors after indexing after (\d+)ms/);
-      assert.ok(m, `E was not given up on after indexing:\n${timeline}`);
-      assert.ok(Number(m[1]) < 10000, `E waited ${m[1]}ms`);
+      const skipped = timeline.match(/\+(\d+)ms \S*E\.java: errors after indexing after (\d+)ms/);
+      const completed = timeline.match(/\+(\d+)ms indexing complete \(1\)/);
+      assert.ok(skipped && completed, `E was not given up on after indexing:\n${timeline}`);
+      // How long indexing takes depends on the machine's load; what the rule
+      // guarantees is the step after it: the server's recomputed diagnostics
+      // (well under 3 s), then POST_INDEX_SETTLE_MS (2 s) without a change.
+      const afterCompletionMs = Number(skipped[1]) - Number(completed[1]);
+      assert.ok(afterCompletionMs <= 2000 + 3000, `E was given up on ${afterCompletionMs}ms after indexing completed`);
+      assert.ok(Number(skipped[2]) < 30000, `E waited ${skipped[2]}ms, not far below the 60 s limit`);
     } finally {
       await finishEnv(env);
     }
