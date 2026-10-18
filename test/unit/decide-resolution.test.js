@@ -3,7 +3,13 @@
 const test = require('node:test');
 const assert = require('node:assert');
 const { EventEmitter } = require('events');
-const { decideResolution, selectEntryAfterRequest, ServerSession } = require('../../format-java.js');
+const {
+  decideResolution,
+  selectEntryAfterRequest,
+  ServerSession,
+  applyEdits,
+  validateEditsWithinText,
+} = require('../../format-java.js');
 
 const OPENED = 1000;
 const CAP = 60000;
@@ -257,6 +263,23 @@ test('requestFreshDiagnostics replaces the first character with itself, or adds 
       { range: { start: { line: 0, character: 0 }, end: { line: 1, character: 0 } }, text: '' },
     ]
   );
+});
+
+test('requestFreshDiagnostics replaces an empty first line with its own line break', () => {
+  const s = createSession();
+  const notes = [];
+  s.client = { notify: (method, params) => notes.push(params) };
+  const doc = { uri: 'file:///p/B.java', version: 1, serverText: '\nclass B {}\n' };
+  s.requestFreshDiagnostics(doc);
+  assert.strictEqual(doc.version, 2);
+  const [change] = notes[0].contentChanges;
+  assert.deepStrictEqual(change, {
+    range: { start: { line: 0, character: 0 }, end: { line: 1, character: 0 } },
+    text: '\n',
+  });
+  // The range lies within the text, and replacing it leaves the text as it was.
+  assert.strictEqual(applyEdits(doc.serverText, [{ range: change.range, newText: change.text }]), doc.serverText);
+  assert.doesNotThrow(() => validateEditsWithinText(doc.serverText, [{ range: change.range, newText: change.text }]));
 });
 
 test('a diagnostics entry from before the document was opened is ignored', () => {

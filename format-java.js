@@ -2118,7 +2118,8 @@ class ServerSession {
   /**
    * Make the server compute the document's diagnostics again, without
    * changing its content: a didChange that replaces the first character with
-   * itself (for an empty document, a newline inserted and removed again).
+   * itself (for an empty first line, its line break; for an empty document, a
+   * newline inserted and removed again).
    */
   requestFreshDiagnostics(doc) {
     const send = (range, text) => {
@@ -2129,7 +2130,10 @@ class ServerSession {
       });
     };
     const at = (line, character) => ({ line, character });
-    if (doc.serverText.length > 0) {
+    if (doc.serverText[0] === '\n') {
+      // An empty first line has no character 1; its line break ends at (1, 0).
+      send({ start: at(0, 0), end: at(1, 0) }, '\n');
+    } else if (doc.serverText.length > 0) {
       send({ start: at(0, 0), end: at(0, 1) }, doc.serverText[0]);
     } else {
       send({ start: at(0, 0), end: at(0, 0) }, '\n');
