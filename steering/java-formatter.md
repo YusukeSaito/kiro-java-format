@@ -20,12 +20,15 @@ Do not hand-edit an import block: the command reads the project's code style
 
 ## Usage
 
-```bash
-# Format one or more files in place (imports are organized too)
-kiro-java-format src/main/java/com/example/Foo.java
+**Pass all the files in one invocation.** Each call starts a JVM, so one call is
+much faster than a loop.
 
-# Format several files
-kiro-java-format $(git diff --name-only '*.java')
+```bash
+# Format files in place (imports are organized too)
+kiro-java-format src/main/java/com/example/Foo.java src/main/java/com/example/Bar.java
+
+# Format every changed Java file in one call
+kiro-java-format $(git diff --name-only --diff-filter=d -- '*.java')
 
 # Check only (exit code 1 if any file would change), don't write
 kiro-java-format --check src/main/java/com/example/Foo.java
@@ -39,14 +42,19 @@ Useful options: `--root <dir>` to set the project root, `--tab-size <n>`,
 
 ## Notes
 
-- The first file is slow: the language server JVM has to start and the project's
-  classpath has to load. Subsequent files in the same invocation are fast, so pass
-  multiple files in one call.
+- The first run in a project is slow (JVM start and indexing). Projects that index
+  slowly get a per-project cached index, so later runs are faster. Parallel calls and
+  repeated files are safe, but prefer one call with all the files: it is faster, and
+  parallel runs are not used to decide whether a project gets the cache.
+- **Verify after formatting.** Compile (`./mvnw -o -q test-compile`), and confirm the
+  diff is only whitespace, line breaks and imports.
 - It writes changes directly to the files. Review the diff afterwards.
 - **`imports skipped (file does not resolve): <path>`** means the file has compile
   errors, so the import block was left alone (organizing it would delete the imports
   of everything that does not resolve). Formatting still ran. Fix the errors and
-  re-run, or accept the imports as they are.
+  re-run, or accept the imports as they are. Once indexing has finished, a file that
+  still has errors is reported this way after about two seconds instead of waiting a
+  minute. Files that use Lombok usually end up here.
 - Organizing imports can change many lines in a file that used `.*` imports. Keep
   that in a commit of its own, separate from logic changes.
 - If the command is not found, the tool is not installed on this machine; see the
