@@ -7,16 +7,47 @@ const test = require('node:test');
 const assert = require('node:assert');
 const fs = require('fs');
 const path = require('path');
-const { spawn } = require('child_process');
+const { spawn, execFileSync } = require('child_process');
 const { pathToFileURL } = require('url');
 const { createIsolatedEnv, listLeftovers, NO_LEFTOVERS } = require('../helpers/env');
-const { resolveTestScript, runCli } = require('../helpers/cli');
+const { WT, resolveTestScript, startCli, runCli, normalizeOutput } = require('../helpers/cli');
 const { FAKE_EXT, buildFakeEnv, writeJavaFiles } = require('../helpers/fake');
 const { waitForNoProcessesWithToken, killOwnPids } = require('../helpers/processes');
 const lib = require('../../format-java.js');
 
 const script = resolveTestScript();
 const LOCK_CHILD = path.join(__dirname, '..', 'helpers', 'lock-child.js');
+/** v1.2.0, which opens one file at a time: the reference for what a call prints and writes. */
+const RELEASED_COMMIT = '08aa8c3';
+
+/**
+ * Write v1.2.0's format-java.js into `dir` and return its path. The basename
+ * stays format-java.js: the lock code recognizes the tool's processes by it.
+ */
+function extractReleasedScript(dir) {
+  const file = path.join(dir, 'format-java.js');
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(file, execFileSync('git', ['-C', WT, 'show', `${RELEASED_COMMIT}:format-java.js`]));
+  return file;
+}
+
+/** Write `contents` (name → text) into `dir` and return the paths, in the order given. */
+function writeFiles(dir, contents) {
+  fs.mkdirSync(dir, { recursive: true });
+  return Object.entries(contents).map(([name, text]) => {
+    const file = path.join(dir, name);
+    fs.writeFileSync(file, text);
+    return file;
+  });
+}
+
+/** stderr without the -v lines. */
+function removeVerboseLines(stderr) {
+  return stderr
+    .split('\n')
+    .filter((line) => !line.startsWith('[kjf]'))
+    .join('\n');
+}
 
 /** A private environment for one test; afterwards nothing of it may be left. */
 function setUpEnv(t) {
@@ -182,4 +213,91 @@ test('when the server exits, the files opened ahead are closed and their locks r
   }
   assert.deepStrictEqual(started, [paths[0]]);
   assert.deepStrictEqual(printed, [`error: ${paths[0]}: language server exited (code 7)`]);
+});
+
+/**
+ * Three calls on the same files, in the order that made two of them wait for
+ * each other until --timeout while a call held the locks of the files it had
+ * opened ahead: Z holds Q for a second; Y = [S, Q, P] starts meanwhile, and X =
+ * [T, P, Q] once Z has let go. Returns Y's and X's results.
+ */
+async function runThreeOverlappingCalls(env, scriptPath, dir) {
+  const [S, T, P, Q] = writeFiles(dir, {
+    'S.java': 'class S {}\n',
+    'T.java': 'class T {}\n',
+    'P.java': 'class P {}\n',
+    'Q.java': 'class Q {}\n',
+  });
+  const fakeEnv = buildFakeEnv(env, { FAKE_DIAGNOSTICS_DELAY_MS: '2000' });
+  const held = holdFileLock(env, Q, 1000);
+  await waitForFileLocks(env, 1);
+  const y = startCli(scriptPath, ['-v', '--timeout', '8', S, Q, P], { cwd: dir, env: fakeEnv, timeoutMs: 60000 });
+  await new Promise((r) => setTimeout(r, 1200));
+  const x = startCli(scriptPath, ['-v', '--timeout', '8', T, P, Q], { cwd: dir, env: fakeEnv, timeoutMs: 60000 });
+  const results = await Promise.all([y.done, x.done]);
+  await held;
+  return results;
+}
+
+test('overlapping calls on the same files do not wait for each other until --timeout', async (t) => {
+  const env = setUpEnv(t);
+  const releasedDir = path.join(env.dir, 'released');
+  const released = await runThreeOverlappingCalls(env, extractReleasedScript(path.join(env.dir, 'v120')), releasedDir);
+  const currentDir = path.join(env.dir, 'current');
+  const current = await runThreeOverlappingCalls(env, script, currentDir);
+  ['Y', 'X'].forEach((name, i) => {
+    const [want, got] = [released[i], current[i]];
+    const label = `${name}: ${got.elapsedMs} ms (v1.2.0 ${want.elapsedMs} ms)`;
+    assert.ok(!/lock wait limit reached/.test(got.stderr), `${label}\n${got.stderr}`);
+    assert.ok(got.elapsedMs <= want.elapsedMs + 3000, label);
+    assert.strictEqual(normalizeOutput(got.stdout, [currentDir]), normalizeOutput(want.stdout, [releasedDir]), label);
+    assert.strictEqual(removeVerboseLines(got.stderr), removeVerboseLines(want.stderr), label);
+    assert.strictEqual(got.code, want.code, label);
+  });
+});
+
+/** Wait until the fake server's log says it opened `file`. */
+async function waitForOpen(logFile, file) {
+  const line = `open ${pathToFileURL(file).href} `;
+  const deadline = Date.now() + 20000;
+  while (!(fs.existsSync(logFile) && fs.readFileSync(logFile, 'utf8').includes(line))) {
+    if (Date.now() > deadline) throw new Error(`${file} was not opened`);
+    await new Promise((r) => setTimeout(r, 10));
+  }
+}
+
+test('a file that changes after it was opened ahead is handled as v1.2.0 handles its new content', async (t) => {
+  const env = setUpEnv(t);
+  const log = path.join(env.dir, 'fake.log');
+  const fake = { FAKE_ERROR_MARKER: 'BROKEN', FAKE_COLLAPSE_SPACES: '1' };
+  // F0 does not resolve, so its turn lasts POST_INDEX_SETTLE_MS: time to change
+  // F1, which resolved when it was opened ahead, into a file that does not
+  // resolve and has formatting to do.
+  const before = { 'F0.java': 'class F0 {} // BROKEN\n', 'F1.java': 'class F1 {}\n', 'F2.java': 'class   F2 {}\n' };
+  const after = { ...before, 'F1.java': 'class   F1 {} // BROKEN\n' };
+  const currentDir = path.join(env.dir, 'current');
+  const paths = writeFiles(currentDir, before);
+  const run = startCli(script, paths, { cwd: currentDir, env: buildFakeEnv(env, { ...fake, FAKE_LOG: log }) });
+  await waitForOpen(log, paths[1]);
+  fs.writeFileSync(paths[1], after['F1.java']);
+  const changedAtMs = Date.now();
+  const got = await run.done;
+
+  const releasedDir = path.join(env.dir, 'released');
+  const releasedPaths = writeFiles(releasedDir, after);
+  const releasedScript = extractReleasedScript(path.join(env.dir, 'v120'));
+  const want = await runCli(releasedScript, releasedPaths, { cwd: releasedDir, env: buildFakeEnv(env, fake) });
+
+  const events = readDocumentEvents(log);
+  const f0Closed = events.find((e) => e.kind === 'close' && e.uri === pathToFileURL(paths[0]).href);
+  assert.ok(f0Closed.atMs > changedAtMs, 'F1 changed before its turn');
+  const f1Opens = events.filter((e) => e.kind === 'open' && e.uri === pathToFileURL(paths[1]).href);
+  assert.strictEqual(f1Opens.length, 1, 'F1 is opened once');
+  assert.strictEqual(normalizeOutput(got.stdout, [currentDir]), normalizeOutput(want.stdout, [releasedDir]));
+  assert.strictEqual(normalizeOutput(got.stderr, [currentDir]), normalizeOutput(want.stderr, [releasedDir]));
+  assert.strictEqual(got.code, want.code);
+  for (const name of Object.keys(after)) {
+    const content = fs.readFileSync(path.join(currentDir, name), 'utf8');
+    assert.strictEqual(content, fs.readFileSync(path.join(releasedDir, name), 'utf8'), name);
+  }
 });

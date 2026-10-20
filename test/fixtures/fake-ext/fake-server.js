@@ -4,7 +4,9 @@
  * A stand-in for nbcode's language server, for tests that do not need Java.
  * It listens like `--start-java-language-server=listen-hash:0`, checks the
  * hash, and answers the requests the CLI sends: no code actions, no edits,
- * no errors. It creates <userdir>/lock while it runs, as NetBeans does.
+ * no errors (unless asked for below). It keeps the text of each open document
+ * as the didOpen and didChange notifications leave it. It creates
+ * <userdir>/lock while it runs, as NetBeans does.
  *
  * Environment:
  *   FAKE_EXIT_BEFORE_LISTEN=<code>      exit with <code> before listening
@@ -14,6 +16,9 @@
  *   FAKE_IGNORE_SIGTERM=1               ignore SIGTERM (only SIGKILL stops it)
  *   FAKE_NO_INDEXING_MESSAGE=1          never send "Indexing completed."
  *   FAKE_DIAGNOSTICS_DELAY_MS=<ms>      publish diagnostics <ms> after didOpen/didChange (default 30)
+ *   FAKE_ERROR_MARKER=<text>            report one error for a document whose text holds <text>
+ *                                       (when the diagnostics are published)
+ *   FAKE_COLLAPSE_SPACES=1              formatting replaces each run of spaces with one space
  *   FAKE_LOG=<file>                     append one line per start, per request, and per
  *                                       didOpen/didClose (`open <uri> <ms>`, `close <uri> <ms>`)
  */
@@ -70,6 +75,50 @@ if (lockFile) fs.writeFileSync(lockFile, String(process.pid));
 
 const counts = new Map();
 const hash = crypto.randomBytes(16).toString('hex');
+// uri → text of the open documents. Line breaks are LF, as NBLS keeps them after didOpen.
+const documents = new Map();
+
+function findOffset(text, pos) {
+  let offset = 0;
+  for (let line = 0; line < pos.line; line++) {
+    const next = text.indexOf('\n', offset);
+    if (next < 0) return text.length;
+    offset = next + 1;
+  }
+  return Math.min(offset + pos.character, text.length);
+}
+
+function applyContentChange(text, change) {
+  if (!change.range) return change.text;
+  return text.slice(0, findOffset(text, change.range.start)) + change.text + text.slice(findOffset(text, change.range.end));
+}
+
+function buildFullRange(text) {
+  const lines = text.split('\n');
+  return { start: { line: 0, character: 0 }, end: { line: lines.length - 1, character: lines[lines.length - 1].length } };
+}
+
+function listDiagnostics(uri) {
+  const text = documents.get(uri);
+  if (!env.FAKE_ERROR_MARKER || text === undefined || !text.includes(env.FAKE_ERROR_MARKER)) return [];
+  return [{ range: buildFullRange(''), severity: 1, message: 'fake error' }];
+}
+
+function buildFormattingEdits(uri) {
+  const text = documents.get(uri);
+  if (env.FAKE_COLLAPSE_SPACES !== '1' || text === undefined) return [];
+  const formatted = text.replace(/ {2,}/g, ' ');
+  return formatted === text ? [] : [{ range: buildFullRange(text), newText: formatted }];
+}
+
+function updateDocuments(msg) {
+  const uri = msg.params.textDocument.uri;
+  if (msg.method === 'textDocument/didOpen') documents.set(uri, msg.params.textDocument.text.replace(/\r\n?/g, '\n'));
+  if (msg.method === 'textDocument/didChange' && documents.has(uri)) {
+    documents.set(uri, msg.params.contentChanges.reduce(applyContentChange, documents.get(uri)));
+  }
+  if (msg.method === 'textDocument/didClose') documents.delete(uri);
+}
 
 function send(socket, msg) {
   const body = Buffer.from(JSON.stringify({ jsonrpc: '2.0', ...msg }), 'utf8');
@@ -90,6 +139,7 @@ function handle(socket, msg) {
     const kind = msg.method === 'textDocument/didOpen' ? 'open' : 'close';
     log(`${kind} ${msg.params.textDocument.uri} ${Date.now()}`);
   }
+  if (/^textDocument\/did(Open|Change|Close)$/.test(msg.method)) updateDocuments(msg);
   switch (msg.method) {
     case 'initialize':
       send(socket, { id: msg.id, result: { capabilities: { documentFormattingProvider: true } } });
@@ -103,9 +153,12 @@ function handle(socket, msg) {
     case 'textDocument/didOpen':
     case 'textDocument/didChange':
       setTimeout(() => {
-        const params = { uri: msg.params.textDocument.uri, diagnostics: [] };
-        send(socket, { method: 'textDocument/publishDiagnostics', params });
+        const uri = msg.params.textDocument.uri;
+        send(socket, { method: 'textDocument/publishDiagnostics', params: { uri, diagnostics: listDiagnostics(uri) } });
       }, diagnosticsDelayMs);
+      return;
+    case 'textDocument/formatting':
+      send(socket, { id: msg.id, result: buildFormattingEdits(msg.params.textDocument.uri) });
       return;
     case 'shutdown':
       send(socket, { id: msg.id, result: null });
@@ -115,8 +168,7 @@ function handle(socket, msg) {
       return;
     default:
       if (isRequest) {
-        const isList = msg.method === 'textDocument/formatting' || msg.method === 'textDocument/codeAction';
-        send(socket, { id: msg.id, result: isList ? [] : null });
+        send(socket, { id: msg.id, result: msg.method === 'textDocument/codeAction' ? [] : null });
       }
   }
 }
