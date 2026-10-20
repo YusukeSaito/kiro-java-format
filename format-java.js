@@ -2457,7 +2457,7 @@ async function organizeAndFormatFile(session, file, opts) {
   const lock = await acquireFileLock(file, opts.timeoutMs);
   let opened;
   try {
-    opened = openLockedFile(session, file, lock, opts);
+    opened = readAndOpenFile(session, file, lock, opts);
   } catch (err) {
     if (lock) releaseFileLock(lock);
     throw err;
@@ -2475,7 +2475,7 @@ async function organizeAndFormatFile(session, file, opts) {
  * Returns `{ file, lock, original, doc, resolution }`, where `resolution` is
  * the wait, or null with --no-organize-imports.
  */
-function openLockedFile(session, file, lock, opts) {
+function readAndOpenFile(session, file, lock, opts) {
   const uri = pathToFileURL(file).href;
   const original = fs.readFileSync(file, 'utf8');
   const doc = session.openDocument(uri, original);
@@ -2494,12 +2494,12 @@ function openLockedFile(session, file, lock, opts) {
  * tried. `openFiles` are the files of this call open now, as this function
  * returned them.
  *
- * Returns what openLockedFile returns, with the file's `identity` (see
- * readFileIdentity). Returns null, and opens nothing, when the lock is held
- * by another run or cannot be made, when the file cannot be stat'ed or read,
- * or when it is one of `openFiles` under another path (a hard link, or another
- * letter case): that one is to be written first, and this path read after it,
- * as at its turn.
+ * Returns what readAndOpenFile returns, always with the lock, and with the
+ * file's `identity` (see readFileIdentity). Returns null, and opens nothing,
+ * when the lock is held by another run or cannot be made, when the file
+ * cannot be stat'ed or read, or when it is one of `openFiles` under another
+ * path (a hard link, or another letter case): that one is to be written
+ * first, and this path read after it, as at its turn.
  */
 async function openFileAhead(session, file, opts, openFiles) {
   const attempt = await tryAcquireFileLock(file);
@@ -2511,7 +2511,7 @@ async function openFileAhead(session, file, opts, openFiles) {
       releaseFileLock(attempt.lock);
       return null;
     }
-    return { ...openLockedFile(session, file, attempt.lock, opts), identity };
+    return { ...readAndOpenFile(session, file, attempt.lock, opts), identity };
   } catch (err) {
     vlog(`not opened ahead: ${file} (${err.message})`);
     releaseFileLock(attempt.lock);
@@ -2530,9 +2530,9 @@ function isSameFileIdentity(a, b) {
 }
 
 /**
- * Organize, format and write a file that openLockedFile opened (at its turn,
- * or ahead of it), then release its lock. Returns this file's exit code: 1 when it would be reformatted
- * (--check) or failed, otherwise 0.
+ * Organize, format and write a file that readAndOpenFile opened (at its turn,
+ * or ahead of it), then release its lock. Returns this file's exit code: 1
+ * when it would be reformatted (--check) or failed, otherwise 0.
  *
  * One bad file must not abandon the rest: a run over a whole tree would then
  * leave some files formatted and the remainder untouched, with no way to tell
@@ -2541,16 +2541,17 @@ function isSameFileIdentity(a, b) {
  * printed: no later file can be formatted either, and formatFiles reports
  * each of them with it.
  *
- * Without the lock (none could be made, or the wait hit its limit),
- * writeFileIfUnchanged still guards the write.
+ * A file opened at its turn has no lock (`opened.lock` is null) when none
+ * could be made or the wait hit its limit; writeFileIfUnchanged still guards
+ * the write. A file opened ahead always has its lock.
  */
-async function organizeAndFormatOpenedFile(session, ahead, opts) {
-  const { file, original } = ahead;
+async function organizeAndFormatOpenedFile(session, opened, opts) {
+  const { file, original } = opened;
   let current = original;
-  let doc = ahead.doc;
+  let doc = opened.doc;
   try {
     if (opts.organizeImports) {
-      const resolution = await ahead.resolution;
+      const resolution = await opened.resolution;
       if (resolution.isResolved) {
         const organized = await session.organizeImports(doc, current, opts.timeoutMs);
         if (organized !== current) {
@@ -2603,18 +2604,22 @@ async function organizeAndFormatOpenedFile(session, ahead, opts) {
     if (err instanceof ServerExitedError) throw err;
     return 1;
   } finally {
-    if (ahead.lock) releaseFileLock(ahead.lock);
+    if (opened.lock) releaseFileLock(opened.lock);
   }
 }
 
-/** Close a file that openFileAhead opened but whose turn never came, and release its lock. */
+/**
+ * Close a file that openFileAhead opened but whose turn never came, and
+ * release its lock. A file opened ahead always has its lock (openFileAhead
+ * opens nothing without it).
+ */
 function closeFileOpenedAhead(session, ahead) {
   try {
     session.closeDocument(ahead.doc);
   } catch {
     /* ignore */
   }
-  if (ahead.lock) releaseFileLock(ahead.lock);
+  releaseFileLock(ahead.lock);
 }
 
 /**
