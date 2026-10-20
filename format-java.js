@@ -1384,8 +1384,10 @@ function releaseFileLock(lock) {
 
 /**
  * Run `fn` while holding the lock for `file` (by real path, so a symlink and
- * its target share one lock). Two runs of this tool on the same file then
- * take turns, and the second finds the first one's result.
+ * its target share one lock), waiting for it as acquireFileLock does.
+ *
+ * The CLI does not use this: it takes its locks in organizeAndFormatFile and
+ * openFileAhead. The tests use it to hold a file's lock from another process.
  */
 async function runWithFileLock(file, timeoutMs, fn) {
   const lock = await acquireFileLock(file, timeoutMs);
