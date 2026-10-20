@@ -2399,37 +2399,71 @@ function isServerUnusable(err) {
  * Organize, format and write one file. Returns this file's exit code: 1 when
  * it would be reformatted (--check) or failed, otherwise 0.
  *
- * One bad file must not abandon the rest: a run over a whole tree would then
- * leave some files formatted and the remainder untouched, with no way to tell
- * where it stopped. So a failure of this file is reported here and returns 1,
- * except for two that are thrown:
- * - ServerExitedError, after this file's line is printed: no later file can
- *   be formatted either, and formatFiles reports each of them with it.
- * - a failure to read the file, before anything is printed for it; it reaches
- *   main, which ends the run with fail(), as earlier versions did.
+ * A failure to read the file is thrown before anything is printed for it; it
+ * reaches main, which ends the run with fail(), as earlier versions did.
+ * Every other failure is handled as organizeAndFormatOpenedFile says.
  *
  * The file is read, formatted and written under its lock, so another run of
  * this tool on the same file waits instead of reading a half-written file.
  */
-function formatOneFile(session, file, opts) {
-  return runWithFileLock(file, opts.timeoutMs, () => organizeAndFormatFile(session, file, opts));
+async function organizeAndFormatFile(session, file, opts) {
+  return organizeAndFormatOpenedFile(session, await openFileAhead(session, file, opts), opts);
 }
 
 /**
- * The body of formatOneFile, run under the file's lock when one could be
- * taken. Without the lock (none could be made, or the wait hit its limit),
+ * Take the lock of `file`, read it, open it in the server and, when imports
+ * are organized, start waiting for whether it resolves. The wait goes on by
+ * itself; organizeAndFormatOpenedFile takes its result.
+ *
+ * Returns `{ file, lock, original, doc, resolution }`: `lock` is null when the
+ * file is processed without one (see acquireFileLock), and `resolution` is the
+ * wait, or null with --no-organize-imports. A failure to read the file is
+ * thrown.
+ */
+async function openFileAhead(session, file, opts) {
+  const lock = await acquireFileLock(file, opts.timeoutMs);
+  let uri;
+  let original;
+  try {
+    uri = pathToFileURL(file).href;
+    original = fs.readFileSync(file, 'utf8');
+  } catch (err) {
+    if (lock) releaseFileLock(lock);
+    throw err;
+  }
+  const doc = session.openDocument(uri, original);
+  let resolution = null;
+  if (opts.organizeImports) {
+    resolution = session.waitForResolution(doc, Math.min(RESOLVE_WAIT_MS, opts.timeoutMs));
+    // Until organizeAndFormatOpenedFile awaits it, a rejection (the server
+    // exited) must not count as unhandled: that would end the run at once.
+    resolution.catch(() => {});
+  }
+  return { file, lock, original, doc, resolution };
+}
+
+/**
+ * Organize, format and write a file that openFileAhead opened, then release
+ * its lock. Returns this file's exit code: 1 when it would be reformatted
+ * (--check) or failed, otherwise 0.
+ *
+ * One bad file must not abandon the rest: a run over a whole tree would then
+ * leave some files formatted and the remainder untouched, with no way to tell
+ * where it stopped. So a failure of this file is reported here and returns 1,
+ * except ServerExitedError, which is thrown after this file's line is
+ * printed: no later file can be formatted either, and formatFiles reports
+ * each of them with it.
+ *
+ * Without the lock (none could be made, or the wait hit its limit),
  * writeFileIfUnchanged still guards the write.
  */
-async function organizeAndFormatFile(session, file, opts) {
-  const uri = pathToFileURL(file).href;
-  const original = fs.readFileSync(file, 'utf8');
+async function organizeAndFormatOpenedFile(session, ahead, opts) {
+  const { file, original } = ahead;
   let current = original;
-  let doc = null;
+  let doc = ahead.doc;
   try {
-    doc = session.openDocument(uri, current);
-
     if (opts.organizeImports) {
-      const resolution = await session.waitForResolution(doc, Math.min(RESOLVE_WAIT_MS, opts.timeoutMs));
+      const resolution = await ahead.resolution;
       if (resolution.isResolved) {
         const organized = await session.organizeImports(doc, current, opts.timeoutMs);
         if (organized !== current) {
@@ -2481,6 +2515,8 @@ async function organizeAndFormatFile(session, file, opts) {
     // Without a server nothing else can be formatted; formatFiles reports the rest.
     if (err instanceof ServerExitedError) throw err;
     return 1;
+  } finally {
+    if (ahead.lock) releaseFileLock(ahead.lock);
   }
 }
 
@@ -2515,7 +2551,7 @@ function splitIntoSegments(files) {
  * Format `files` in order and return the exit code. Each segment (see
  * splitIntoSegments) runs in its own language server. Throws when a server
  * cannot be started or a file cannot be read; other failures of single files
- * are reported by formatOneFile.
+ * are reported by organizeAndFormatOpenedFile.
  *
  * When a server exits in the middle, every file it did not get to is
  * reported with the same error at once, and no further server is started.
@@ -2543,7 +2579,7 @@ async function formatFiles(files, context) {
       await runWithServerSession(context, lease, async (session) => {
         for (const file of segment) {
           notStarted.shift();
-          exitCode = Math.max(exitCode, await formatOneFile(session, file, context.opts));
+          exitCode = Math.max(exitCode, await organizeAndFormatFile(session, file, context.opts));
         }
         const nowMs = Date.now();
         indexing = session.measureIndexingTime(nowMs);
