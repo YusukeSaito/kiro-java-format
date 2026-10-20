@@ -22,6 +22,8 @@ This tool:
 3. Connects over a local socket and performs the auth handshake.
 4. Speaks LSP: `initialize` → `didOpen` → `source.organizeImports` code action →
    `textDocument/formatting`, applies the returned edits to the file, then `shutdown`.
+   Given several files, it opens up to 16 at once so the server checks them side by
+   side; each is still organized, formatted and written one at a time, in the order given.
 
 It is a single dependency-free Node script — nothing is installed globally except a
 small symlink.
