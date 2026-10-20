@@ -1387,7 +1387,8 @@ function releaseFileLock(lock) {
  * its target share one lock), waiting for it as acquireFileLock does.
  *
  * The CLI does not use this: it takes its locks in organizeAndFormatFile and
- * openFileAhead. The tests use it to hold a file's lock from another process.
+ * openFileAhead. Only the tests use it: to hold a file's lock in another
+ * process, and to wait for one.
  */
 async function runWithFileLock(file, timeoutMs, fn) {
   const lock = await acquireFileLock(file, timeoutMs);
