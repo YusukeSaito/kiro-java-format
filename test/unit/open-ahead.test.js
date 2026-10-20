@@ -191,6 +191,40 @@ test('a file whose lock another run holds stops the window, and is waited for at
   assertOpenedUnderLock(log);
 });
 
+// Past --timeout the wait for a lock gives up and the file is formatted
+// without it, as v1.2.0 does: only a file opened at its turn can be open
+// without its lock.
+test('a file whose lock another run holds past --timeout is formatted without it at its turn', async (t) => {
+  const env = setUpEnv(t);
+  const log = path.join(env.dir, 'fake.log');
+  const paths = writeJavaFiles(env.dir, 3);
+  const timeoutMs = 2000;
+  const holdMs = 8000;
+  const held = holdFileLock(env, paths[1], holdMs);
+  await waitForFileLocks(env, 1);
+  const r = await runCli(script, ['--timeout', String(timeoutMs / 1000), ...paths], {
+    cwd: env.dir,
+    env: buildFakeEnv(env, { FAKE_LOG: log }),
+    timeoutMs: 60000,
+  });
+  const heldUntilMs = (await held).enteredAt + holdMs;
+  assert.strictEqual(r.stderr, '');
+  assert.strictEqual(r.code, 0);
+  assert.strictEqual(r.stdout, paths.map((p) => `unchanged: ${p}\n`).join(''));
+  const events = readDocumentEvents(log);
+  const at = (kind, file) => events.find((e) => e.kind === kind && e.uri === pathToFileURL(file).href).atMs;
+  const waitedMs = at('open', paths[1]) - at('close', paths[0]);
+  assert.ok(waitedMs >= timeoutMs / 2, `the held file is waited for at its turn (${waitedMs} ms)`);
+  assert.ok(at('open', paths[1]) < heldUntilMs, 'the held file is opened before its lock is free');
+  assert.deepStrictEqual(
+    readLockStates(log).map((s) => s.state),
+    ['held', 'other', 'held'],
+    'only the held file is opened without its lock'
+  );
+  const locksDir = path.join(env.KIRO_JAVA_FORMAT_CACHE, 'locks');
+  assert.deepStrictEqual(fs.readdirSync(locksDir), [], 'no lock is left');
+});
+
 test('when the server exits, the files opened ahead are closed and their locks released', async (t) => {
   const env = setUpEnv(t);
   const paths = writeJavaFiles(env.dir, 5);
