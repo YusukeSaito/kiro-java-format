@@ -2440,56 +2440,44 @@ function isServerUnusable(err) {
 // ---------------------------------------------------------------------------
 
 /**
- * Organize, format and write one file. Returns this file's exit code: 1 when
- * it would be reformatted (--check) or failed, otherwise 0.
+ * Organize, format and write one file that was not opened ahead, at its turn.
+ * Returns this file's exit code: 1 when it would be reformatted (--check) or
+ * failed, otherwise 0.
  *
- * A failure to read the file is thrown before anything is printed for it; it
- * reaches main, which ends the run with fail(), as earlier versions did.
- * Every other failure is handled as organizeAndFormatOpenedFile says.
+ * The lock is waited for as acquireFileLock does. The caller holds no other
+ * file lock then (see formatSegmentAhead), so two runs never wait for each
+ * other. A failure to read the file is thrown before anything is printed for
+ * it; it reaches main, which ends the run with fail(), as earlier versions
+ * did. Every other failure is handled as organizeAndFormatOpenedFile says.
  *
  * The file is read, formatted and written under its lock, so another run of
  * this tool on the same file waits instead of reading a half-written file.
  */
 async function organizeAndFormatFile(session, file, opts) {
-  const ahead = await openFileAhead(session, file, opts, { shouldWaitForLock: true });
-  return organizeAndFormatOpenedFile(session, ahead, opts);
+  const lock = await acquireFileLock(file, opts.timeoutMs);
+  let opened;
+  try {
+    opened = openLockedFile(session, file, lock, opts);
+  } catch (err) {
+    if (lock) releaseFileLock(lock);
+    throw err;
+  }
+  return organizeAndFormatOpenedFile(session, opened, opts);
 }
 
 /**
- * Take the lock of `file`, read it, open it in the server and, when imports
- * are organized, start waiting for whether it resolves. The wait goes on by
- * itself; organizeAndFormatOpenedFile takes its result.
+ * Read `file`, whose lock is `lock` (null when the file is processed without
+ * one; see acquireFileLock), open it in the server and, when imports are
+ * organized, start waiting for whether it resolves. The wait goes on by
+ * itself; organizeAndFormatOpenedFile takes its result. Throws when the file
+ * cannot be read; the lock is the caller's to release then.
  *
- * At the file's turn (`shouldWaitForLock`), the lock is waited for as
- * acquireFileLock does, and a failure to read the file is thrown. Ahead of its
- * turn, the lock is only tried, so opening ahead never waits for another run:
- * when another run holds the lock, or the file cannot be read, nothing is
- * opened and null is returned. The file is then taken at its turn.
- *
- * Returns `{ file, lock, original, doc, resolution }`: `lock` is null when the
- * file is processed without one (see acquireFileLock), and `resolution` is the
- * wait, or null with --no-organize-imports.
+ * Returns `{ file, lock, original, doc, resolution }`, where `resolution` is
+ * the wait, or null with --no-organize-imports.
  */
-async function openFileAhead(session, file, opts, { shouldWaitForLock }) {
-  let lock;
-  if (shouldWaitForLock) {
-    lock = await acquireFileLock(file, opts.timeoutMs);
-  } else {
-    const attempt = await tryAcquireFileLock(file);
-    if (attempt.kind === 'busy') return null;
-    lock = attempt.kind === 'acquired' ? attempt.lock : null;
-  }
-  let uri;
-  let original;
-  try {
-    uri = pathToFileURL(file).href;
-    original = fs.readFileSync(file, 'utf8');
-  } catch (err) {
-    if (lock) releaseFileLock(lock);
-    // Ahead of its turn, leave it: read at its turn, the failure ends the run as before.
-    if (!shouldWaitForLock) return null;
-    throw err;
-  }
+function openLockedFile(session, file, lock, opts) {
+  const uri = pathToFileURL(file).href;
+  const original = fs.readFileSync(file, 'utf8');
   const doc = session.openDocument(uri, original);
   let resolution = null;
   if (opts.organizeImports) {
@@ -2502,8 +2490,48 @@ async function openFileAhead(session, file, opts, { shouldWaitForLock }) {
 }
 
 /**
- * Organize, format and write a file that openFileAhead opened, then release
- * its lock. Returns this file's exit code: 1 when it would be reformatted
+ * Open `file` ahead of its turn, when that needs no waiting: its lock is only
+ * tried. `openFiles` are the files of this call open now, as this function
+ * returned them.
+ *
+ * Returns what openLockedFile returns, with the file's `identity` (see
+ * readFileIdentity). Returns null, and opens nothing, when the lock is held
+ * by another run or cannot be made, when the file cannot be stat'ed or read,
+ * or when it is one of `openFiles` under another path (a hard link, or another
+ * letter case): that one is to be written first, and this path read after it,
+ * as at its turn.
+ */
+async function openFileAhead(session, file, opts, openFiles) {
+  const attempt = await tryAcquireFileLock(file);
+  if (attempt.kind !== 'acquired') return null;
+  try {
+    const identity = readFileIdentity(file);
+    if (openFiles.some((opened) => isSameFileIdentity(opened.identity, identity))) {
+      vlog(`not opened ahead: ${file} is open under another path`);
+      releaseFileLock(attempt.lock);
+      return null;
+    }
+    return { ...openLockedFile(session, file, attempt.lock, opts), identity };
+  } catch (err) {
+    vlog(`not opened ahead: ${file} (${err.message})`);
+    releaseFileLock(attempt.lock);
+    return null;
+  }
+}
+
+/** The device and inode of `file` (after symlinks), as bigints so that none is rounded. */
+function readFileIdentity(file) {
+  const st = fs.statSync(file, { bigint: true });
+  return { dev: st.dev, ino: st.ino };
+}
+
+function isSameFileIdentity(a, b) {
+  return a.dev === b.dev && a.ino === b.ino;
+}
+
+/**
+ * Organize, format and write a file that openLockedFile opened (at its turn,
+ * or ahead of it), then release its lock. Returns this file's exit code: 1 when it would be reformatted
  * (--check) or failed, otherwise 0.
  *
  * One bad file must not abandon the rest: a run over a whole tree would then
@@ -2595,25 +2623,35 @@ function closeFileOpenedAhead(session, ahead) {
  * comes.
  *
  * Most of a file's time goes to waiting for the server to tell whether it
- * resolves, so up to OPEN_AHEAD_MAX files are opened ahead of their turn and
- * waited on together; after each file the next one is opened. Organizing,
- * formatting, writing and printing still go one file at a time, in argument
- * order. A file whose lock another run holds is not opened ahead; at its turn
- * its lock is waited for as before.
+ * resolves, so up to OPEN_AHEAD_MAX files, from the current one on, are opened
+ * ahead of their turn and waited on together; after each file the window
+ * moves on. Organizing, formatting, writing and printing still go one file at
+ * a time, in argument order.
+ *
+ * A file is open only while this call holds its lock, and the window stops at
+ * the first file openFileAhead does not open: the files after it wait until it
+ * has had its turn. So when a turn comes for a file that is not open, every
+ * file before it is done and released, and its lock is waited for (by
+ * organizeAndFormatFile) while this call holds no other: no two runs can wait
+ * for each other.
  *
  * Throws what organizeAndFormatFile throws. The files still open are then
  * closed and their locks released.
  */
 async function formatSegmentAhead(session, segment, opts, onStart) {
-  // The files opened ahead whose turn has not come, by their index in `segment`.
+  // The files opened ahead whose turn has not come, by their index in
+  // `segment`: always the indexes from the current turn up to `nextIndex`.
   const openedAhead = new Map();
   let nextIndex = 0;
   let exitCode = 0;
   try {
     for (let i = 0; i < segment.length; i++) {
-      for (; nextIndex < segment.length && nextIndex < i + OPEN_AHEAD_MAX; nextIndex++) {
-        const opened = await openFileAhead(session, segment[nextIndex], opts, { shouldWaitForLock: false });
-        if (opened) openedAhead.set(nextIndex, opened);
+      nextIndex = Math.max(nextIndex, i);
+      while (nextIndex < Math.min(segment.length, i + OPEN_AHEAD_MAX)) {
+        const opened = await openFileAhead(session, segment[nextIndex], opts, [...openedAhead.values()]);
+        if (!opened) break;
+        openedAhead.set(nextIndex, opened);
+        nextIndex++;
       }
       onStart(segment[i]);
       const ahead = openedAhead.get(i);
