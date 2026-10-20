@@ -13,7 +13,9 @@
  *   FAKE_EXIT_ON=<method>:<n>:<code>    exit with <code> on the n-th <method> request
  *   FAKE_IGNORE_SIGTERM=1               ignore SIGTERM (only SIGKILL stops it)
  *   FAKE_NO_INDEXING_MESSAGE=1          never send "Indexing completed."
- *   FAKE_LOG=<file>                     append one line per start and per request
+ *   FAKE_DIAGNOSTICS_DELAY_MS=<ms>      publish diagnostics <ms> after didOpen/didChange (default 30)
+ *   FAKE_LOG=<file>                     append one line per start, per request, and per
+ *                                       didOpen/didClose (`open <uri> <ms>`, `close <uri> <ms>`)
  */
 
 const fs = require('fs');
@@ -38,6 +40,7 @@ function parseRule(value) {
 
 const noReply = parseRule(env.FAKE_NO_REPLY);
 const exitOn = parseRule(env.FAKE_EXIT_ON);
+const diagnosticsDelayMs = parseInt(env.FAKE_DIAGNOSTICS_DELAY_MS || '30', 10);
 const lockFile = userdir ? path.join(userdir, 'lock') : null;
 
 function removeLock() {
@@ -83,6 +86,10 @@ function handle(socket, msg) {
     if (exitOn && exitOn.method === msg.method && exitOn.n === n) exit(exitOn.code);
     if (noReply && noReply.method === msg.method && noReply.n === n) return;
   }
+  if (msg.method === 'textDocument/didOpen' || msg.method === 'textDocument/didClose') {
+    const kind = msg.method === 'textDocument/didOpen' ? 'open' : 'close';
+    log(`${kind} ${msg.params.textDocument.uri} ${Date.now()}`);
+  }
   switch (msg.method) {
     case 'initialize':
       send(socket, { id: msg.id, result: { capabilities: { documentFormattingProvider: true } } });
@@ -98,7 +105,7 @@ function handle(socket, msg) {
       setTimeout(() => {
         const params = { uri: msg.params.textDocument.uri, diagnostics: [] };
         send(socket, { method: 'textDocument/publishDiagnostics', params });
-      }, 30);
+      }, diagnosticsDelayMs);
       return;
     case 'shutdown':
       send(socket, { id: msg.id, result: null });
