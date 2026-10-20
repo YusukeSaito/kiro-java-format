@@ -1371,7 +1371,9 @@ async function attemptFileLock(file, lockPath) {
       vlog(`no lock for ${file} (${err.message}); continuing without the lock`);
       return { kind: 'unavailable' };
     }
-    if (!((await isLockStale(read, Date.now())) && breakStaleLock(lockPath, read))) return { kind: 'busy' };
+    const isBroken = (await isLockStale(read, Date.now())) && breakStaleLock(lockPath, read);
+    if (!isBroken) return { kind: 'busy' };
+    // The left-over lock is gone: try again.
   }
 }
 
