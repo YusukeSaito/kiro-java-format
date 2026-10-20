@@ -1299,39 +1299,71 @@ const heldFileLocks = new Map();
  * can be made. Either way the write is still guarded by writeFileIfUnchanged.
  */
 async function acquireFileLock(file, timeoutMs) {
-  let lockPath;
+  const lockPath = resolveFileLockPath(file);
+  if (lockPath === null) return null;
+  const deadlineMs = Date.now() + timeoutMs;
+  for (;;) {
+    const attempt = await attemptFileLock(file, lockPath);
+    if (attempt.kind === 'acquired') return attempt.lock;
+    if (attempt.kind === 'unavailable') return null;
+    if (hasDeadlinePassed(deadlineMs)) {
+      vlog(`lock wait limit reached for ${file}; continuing without the lock`);
+      return null;
+    }
+    await waitMs(LOCK_RETRY_MS);
+  }
+}
+
+/**
+ * Take the lock for one file if no other run holds it, without waiting.
+ * Returns `{ kind: 'acquired', lock }`, `{ kind: 'busy' }` while another run
+ * holds it, or `{ kind: 'unavailable' }` when no lock can be made (the file
+ * is then processed without one, as with acquireFileLock).
+ */
+async function tryAcquireFileLock(file) {
+  const lockPath = resolveFileLockPath(file);
+  if (lockPath === null) return { kind: 'unavailable' };
+  return attemptFileLock(file, lockPath);
+}
+
+/**
+ * The lock file of `file`, named by its real path, or null when there can be
+ * none (the lock directory cannot be made, or the path cannot be resolved).
+ */
+function resolveFileLockPath(file) {
   try {
     const lockDir = ensurePrivateDir(resolveLockDir(resolveCurrentCacheRoot()));
     const key = crypto.createHash('sha256').update(fs.realpathSync(file)).digest('hex').slice(0, 16);
-    lockPath = path.join(lockDir, `${key}.lock`);
+    return path.join(lockDir, `${key}.lock`);
   } catch (err) {
     vlog(`no lock for ${file} (${err.message}); continuing without the lock`);
     return null;
   }
-  const deadlineMs = Date.now() + timeoutMs;
+}
+
+/**
+ * One attempt at the lock of `file` at `lockPath`, breaking it first when it
+ * is left over. Returns what tryAcquireFileLock returns.
+ */
+async function attemptFileLock(file, lockPath) {
   for (;;) {
     const r = acquireLockFile(lockPath, {});
     if (r.kind === 'acquired') {
       heldFileLocks.set(lockPath, r.nonce);
-      return { lockPath, nonce: r.nonce };
+      return { kind: 'acquired', lock: { lockPath, nonce: r.nonce } };
     }
     if (r.kind === 'unusable') {
       vlog(`no lock for ${file} (${r.reason}); continuing without the lock`);
-      return null;
+      return { kind: 'unavailable' };
     }
     let read;
     try {
       read = readLockRecord(lockPath);
     } catch (err) {
       vlog(`no lock for ${file} (${err.message}); continuing without the lock`);
-      return null;
+      return { kind: 'unavailable' };
     }
-    if ((await isLockStale(read, Date.now())) && breakStaleLock(lockPath, read)) continue;
-    if (hasDeadlinePassed(deadlineMs)) {
-      vlog(`lock wait limit reached for ${file}; continuing without the lock`);
-      return null;
-    }
-    await waitMs(LOCK_RETRY_MS);
+    if (!((await isLockStale(read, Date.now())) && breakStaleLock(lockPath, read))) return { kind: 'busy' };
   }
 }
 
