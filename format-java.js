@@ -1905,6 +1905,10 @@ class ServerSession {
     this.ownerLock = null;
     // 'diagnostics' (uri), 'indexPhase', 'exit'
     this.events = new EventEmitter();
+    // Each document waiting in waitForResolution listens to every event, and
+    // up to OPEN_AHEAD_MAX wait at once. Node's warning past that limit still
+    // reports a wait that never removed its listeners.
+    this.events.setMaxListeners(OPEN_AHEAD_MAX);
     // Some code actions push their result instead of returning it. Keep the
     // last pushed edit so the organize-imports step can pick it up.
     this.pushedEdit = null;
