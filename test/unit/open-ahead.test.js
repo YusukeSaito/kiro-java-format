@@ -273,6 +273,7 @@ test('overlapping calls on the same files do not wait for each other until --tim
   ['Y', 'X'].forEach((name, i) => {
     const [want, got] = [released[i], current[i]];
     const label = `${name}: ${got.elapsedMs} ms (v1.2.0 ${want.elapsedMs} ms)`;
+    t.diagnostic(label);
     assert.ok(!/lock wait limit reached/.test(got.stderr), `${label}\n${got.stderr}`);
     assert.ok(got.elapsedMs <= want.elapsedMs + 3000, label);
     assert.strictEqual(normalizeOutput(got.stdout, [currentDir]), normalizeOutput(want.stdout, [releasedDir]), label);

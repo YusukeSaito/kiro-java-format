@@ -218,6 +218,58 @@ describe('corruption', { skip }, () => {
     report(t, 'parallel-overlap', tally);
   });
 
+  // [A, B] and [B, A] at once on one copy: each call meets the other's first
+  // file. Neither may wait for the other until --timeout (a lock wait that
+  // reaches it makes the call last at least that long), and the two must
+  // print and leave what one call after the other would.
+  it('parallel-swapped-pair', async (t) => {
+    const golden = await getGolden(FILES, []);
+    const pair = FILES.slice(0, 2);
+    const expected = expectedForCall(golden, pair);
+    const timeoutSec = 60;
+    const env = createIsolatedEnv();
+    const tally = createTally();
+    try {
+      await runUnderStress(async () => {
+        for (let round = 0; round < ROUNDS; round++) {
+          const problems = [];
+          const copy = copyFixture('corruption', path.join(env.dir, `swap-${round}`), { gitMarker: true });
+          const results = await Promise.all(
+            [pair, [...pair].reverse()].map((files) =>
+              runCli(script, ['--timeout', String(timeoutSec), ...files.map((f) => path.join(copy, f))], {
+                cwd: copy,
+                env: env.buildEnv(),
+                timeoutMs: RUN_TIMEOUT_MS,
+              })
+            )
+          );
+          results.forEach((r, i) => {
+            t.diagnostic(`round ${round} call ${i}: ${r.elapsedMs} ms`);
+            const label = `round ${round} call ${i}`;
+            if (r.code !== 0) problems.push(`${label}: exit ${r.code} (signal ${r.signal})`);
+            if (r.stderr !== '') problems.push(`${label}: stderr not empty\n${r.stderr}`);
+            if (r.elapsedMs >= timeoutSec * 1000) problems.push(`${label}: took ${r.elapsedMs} ms, --timeout or more`);
+          });
+          const lines = results.flatMap((r) => normalizeOutput(r.stdout, [copy]).split('\n').filter(Boolean));
+          for (const rel of pair) {
+            const want = golden.perFile.find((e) => e.file === rel).stdout.split('\n').filter(Boolean);
+            const second = want.map((l) => l.replace(/^formatted: /, 'unchanged: '));
+            const expectedLines = [...want, ...second].sort();
+            const got = lines.filter((l) => l.endsWith(`<ROOT>/${rel}`)).sort();
+            if (JSON.stringify(got) !== JSON.stringify(expectedLines)) {
+              problems.push(`round ${round} ${rel}: lines ${JSON.stringify(got)}, expected ${JSON.stringify(expectedLines)}`);
+            }
+          }
+          problems.push(...compareContents(`round ${round}`, expected.contents, copy));
+          tally.record(problems);
+        }
+      });
+    } finally {
+      await finishEnv(t, env);
+    }
+    report(t, 'parallel-swapped-pair', tally);
+  });
+
   it('duplicates', async (t) => {
     const goldenWrite = await getGolden(DUPLICATES, []);
     const goldenCheck = await getGolden(DUPLICATES, ['--check']);
