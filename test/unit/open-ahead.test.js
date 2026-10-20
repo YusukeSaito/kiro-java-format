@@ -148,22 +148,47 @@ function holdFileLock(env, file, holdMs) {
   });
 }
 
-test('a file whose lock another run holds is not waited for ahead of its turn', async (t) => {
+/** The `lock` lines of the fake server's log: for each didOpen, whether the call held the file's lock. */
+function readLockStates(logFile) {
+  return fs
+    .readFileSync(logFile, 'utf8')
+    .split('\n')
+    .map((line) => line.match(/^lock (\S+) (\S+)$/))
+    .filter(Boolean)
+    .map((m) => ({ uri: m[1], state: m[2] }));
+}
+
+/** Assert that every document in the fake server's log was opened while its call held the file's lock. */
+function assertOpenedUnderLock(logFile) {
+  const states = readLockStates(logFile);
+  const opens = readDocumentEvents(logFile).filter((e) => e.kind === 'open');
+  assert.strictEqual(states.length, opens.length, 'every didOpen is checked');
+  assert.deepStrictEqual(
+    states.filter((s) => s.state !== 'held'),
+    [],
+    'every document is opened while its lock is held'
+  );
+}
+
+test('a file whose lock another run holds stops the window, and is waited for at its turn', async (t) => {
   const env = setUpEnv(t);
   const log = path.join(env.dir, 'fake.log');
   const paths = writeJavaFiles(env.dir, 3);
-  const held = holdFileLock(env, paths[1], 5000);
+  const holdMs = 5000;
+  const held = holdFileLock(env, paths[1], holdMs);
   await waitForFileLocks(env, 1);
   const r = await runCli(script, paths, { cwd: env.dir, env: buildFakeEnv(env, { FAKE_LOG: log }), timeoutMs: 60000 });
-  const { leftAt } = await held;
+  // The holder lets go no earlier than this.
+  const heldUntilMs = (await held).enteredAt + holdMs;
   assert.strictEqual(r.stderr, '');
   assert.strictEqual(r.code, 0);
   assert.strictEqual(r.stdout, paths.map((p) => `unchanged: ${p}\n`).join(''));
   const events = readDocumentEvents(log);
   const at = (kind, file) => events.find((e) => e.kind === kind && e.uri === pathToFileURL(file).href).atMs;
-  assert.ok(at('close', paths[0]) < leftAt, 'the first file is done while the second one is still held');
-  assert.ok(at('open', paths[2]) < leftAt, 'the third file is opened ahead while the second one is still held');
-  assert.ok(at('open', paths[1]) >= leftAt, 'the held file is opened at its turn, once the lock is free');
+  assert.ok(at('close', paths[0]) < heldUntilMs, 'the first file is done while the second one is held');
+  assert.ok(at('open', paths[1]) >= heldUntilMs, 'the held file is opened once its lock is free');
+  assert.ok(at('open', paths[2]) >= at('open', paths[1]), 'the file after the held one is not opened before it');
+  assertOpenedUnderLock(log);
 });
 
 test('when the server exits, the files opened ahead are closed and their locks released', async (t) => {
@@ -266,38 +291,129 @@ async function waitForOpen(logFile, file) {
   }
 }
 
-test('a file that changes after it was opened ahead is handled as v1.2.0 handles its new content', async (t) => {
+// A writer that does not take the lock (an editor, say) can change a file
+// while it is open, as in v1.2.0; the window only makes that time longer. The
+// write of the formatted text is then refused, and the file keeps their text.
+test('a file written by someone else after it was opened ahead is left as they wrote it', async (t) => {
   const env = setUpEnv(t);
   const log = path.join(env.dir, 'fake.log');
-  const fake = { FAKE_ERROR_MARKER: 'BROKEN', FAKE_COLLAPSE_SPACES: '1' };
-  // F0 does not resolve, so its turn lasts POST_INDEX_SETTLE_MS: time to change
-  // F1, which resolved when it was opened ahead, into a file that does not
-  // resolve and has formatting to do.
-  const before = { 'F0.java': 'class F0 {} // BROKEN\n', 'F1.java': 'class F1 {}\n', 'F2.java': 'class   F2 {}\n' };
-  const after = { ...before, 'F1.java': 'class   F1 {} // BROKEN\n' };
-  const currentDir = path.join(env.dir, 'current');
-  const paths = writeFiles(currentDir, before);
-  const run = startCli(script, paths, { cwd: currentDir, env: buildFakeEnv(env, { ...fake, FAKE_LOG: log }) });
+  // F0 does not resolve, so its turn lasts POST_INDEX_SETTLE_MS: time to
+  // change F1, opened ahead, before its turn.
+  const paths = writeFiles(env.dir, {
+    'F0.java': 'class F0 {} // BROKEN\n',
+    'F1.java': 'class   F1 {}\n',
+    'F2.java': 'class F2 {}\n',
+  });
+  const fake = { FAKE_ERROR_MARKER: 'BROKEN', FAKE_COLLAPSE_SPACES: '1', FAKE_LOG: log };
+  const run = startCli(script, paths, { cwd: env.dir, env: buildFakeEnv(env, fake) });
   await waitForOpen(log, paths[1]);
-  fs.writeFileSync(paths[1], after['F1.java']);
+  const outside = 'class F1 {} // written outside\n';
+  fs.writeFileSync(paths[1], outside);
   const changedAtMs = Date.now();
-  const got = await run.done;
-
-  const releasedDir = path.join(env.dir, 'released');
-  const releasedPaths = writeFiles(releasedDir, after);
-  const releasedScript = extractReleasedScript(path.join(env.dir, 'v120'));
-  const want = await runCli(releasedScript, releasedPaths, { cwd: releasedDir, env: buildFakeEnv(env, fake) });
-
-  const events = readDocumentEvents(log);
-  const f0Closed = events.find((e) => e.kind === 'close' && e.uri === pathToFileURL(paths[0]).href);
+  const r = await run.done;
+  const f0Closed = readDocumentEvents(log).find((e) => e.kind === 'close' && e.uri === pathToFileURL(paths[0]).href);
   assert.ok(f0Closed.atMs > changedAtMs, 'F1 changed before its turn');
-  const f1Opens = events.filter((e) => e.kind === 'open' && e.uri === pathToFileURL(paths[1]).href);
-  assert.strictEqual(f1Opens.length, 1, 'F1 is opened once');
-  assert.strictEqual(normalizeOutput(got.stdout, [currentDir]), normalizeOutput(want.stdout, [releasedDir]));
-  assert.strictEqual(normalizeOutput(got.stderr, [currentDir]), normalizeOutput(want.stderr, [releasedDir]));
-  assert.strictEqual(got.code, want.code);
-  for (const name of Object.keys(after)) {
-    const content = fs.readFileSync(path.join(currentDir, name), 'utf8');
-    assert.strictEqual(content, fs.readFileSync(path.join(releasedDir, name), 'utf8'), name);
+  assert.strictEqual(
+    r.stdout,
+    `imports skipped (file does not resolve): ${paths[0]}\nunchanged: ${paths[0]}\nunchanged: ${paths[2]}\n`
+  );
+  assert.strictEqual(r.stderr, `error: ${paths[1]}: changed on disk while formatting; not written\n`);
+  assert.strictEqual(r.code, 1);
+  assert.strictEqual(fs.readFileSync(paths[1], 'utf8'), outside);
+});
+
+/** Run one call over `paths`, with the fake server collapsing runs of spaces when it formats. */
+function runOnPaths(env, paths) {
+  return runCli(script, paths, { cwd: env.dir, env: buildFakeEnv(env, { FAKE_COLLAPSE_SPACES: '1' }), timeoutMs: 60000 });
+}
+
+test('a file given again under a hard link is read after the first path is written, as in v1.2.0', async (t) => {
+  const env = setUpEnv(t);
+  const [first] = writeFiles(env.dir, { 'H1.java': 'class   H {}\n' });
+  const second = path.join(env.dir, 'H2.java');
+  fs.linkSync(first, second);
+  const r = await runOnPaths(env, [first, second]);
+  assert.strictEqual(r.stderr, '');
+  assert.strictEqual(r.stdout, `formatted: ${first}\nunchanged: ${second}\n`);
+  assert.strictEqual(r.code, 0);
+  assert.strictEqual(fs.readFileSync(first, 'utf8'), 'class H {}\n');
+});
+
+test('a file given again in another letter case is read after the first path is written, as in v1.2.0', async (t) => {
+  const env = setUpEnv(t);
+  const [first] = writeFiles(env.dir, { 'Cv.java': 'class   Cv {}\n' });
+  const second = path.join(env.dir, 'CV.java');
+  if (!fs.existsSync(second)) {
+    t.skip('this file system tells letter case apart');
+    return;
   }
+  const r = await runOnPaths(env, [first, second]);
+  assert.strictEqual(r.stderr, '');
+  assert.strictEqual(r.stdout, `formatted: ${first}\nunchanged: ${second}\n`);
+  assert.strictEqual(r.code, 0);
+  assert.strictEqual(fs.readFileSync(first, 'utf8'), 'class Cv {}\n');
+});
+
+test('a call waits for a file that another call opened ahead about as long as that call takes for its window', async (t) => {
+  const env = setUpEnv(t);
+  const formattingMs = 200;
+  const fake = { FAKE_COLLAPSE_SPACES: '1', FAKE_FORMATTING_DELAY_MS: String(formattingMs) };
+  const contents = {};
+  for (let i = 0; i < 40; i++) contents[`F${i}.java`] = `class   F${i} {}\n`;
+  const paths = writeFiles(env.dir, contents);
+  const target = paths[20];
+  const logA = path.join(env.dir, 'a.log');
+  const logB = path.join(env.dir, 'b.log');
+  const a = startCli(script, paths, { cwd: env.dir, env: buildFakeEnv(env, { ...fake, FAKE_LOG: logA }) });
+  // A opens the target ahead of its turn, and holds its lock from then on.
+  await waitForOpen(logA, target);
+  const bStartedAtMs = Date.now();
+  const b = startCli(script, ['--timeout', '30', target], {
+    cwd: env.dir,
+    env: buildFakeEnv(env, { ...fake, FAKE_LOG: logB }),
+  });
+  const [ra, rb] = await Promise.all([a.done, b.done]);
+  assert.strictEqual(ra.stderr, '');
+  assert.strictEqual(ra.code, 0);
+  assert.strictEqual(ra.stdout, paths.map((p) => `formatted: ${p}\n`).join(''));
+  assert.strictEqual(rb.stderr, '');
+  assert.strictEqual(rb.code, 0);
+  assert.strictEqual(rb.stdout, `unchanged: ${target}\n`);
+  const at = (logFile, kind) =>
+    readDocumentEvents(logFile).find((e) => e.kind === kind && e.uri === pathToFileURL(target).href).atMs;
+  assert.ok(at(logB, 'open') >= at(logA, 'close'), 'B opens the target once A is done with it');
+  const waitedMs = at(logB, 'open') - bStartedAtMs;
+  const boundMs = (lib.OPEN_AHEAD_MAX + 1) * formattingMs + 3000;
+  t.diagnostic(`B opened the target ${waitedMs} ms after it started (bound ${boundMs} ms)`);
+  assert.ok(waitedMs <= boundMs, `B waited ${waitedMs} ms`);
+  assertOpenedUnderLock(logA);
+  assertOpenedUnderLock(logB);
+});
+
+test('two calls over the same files in opposite orders open every document under its lock', async (t) => {
+  const env = setUpEnv(t);
+  const contents = {};
+  for (let i = 0; i < 20; i++) contents[`F${i}.java`] = `class   F${i} {}\n`;
+  const paths = writeFiles(env.dir, contents);
+  const logs = [path.join(env.dir, 'x.log'), path.join(env.dir, 'y.log')];
+  const orders = [paths, [...paths].reverse()];
+  const results = await Promise.all(
+    orders.map((order, i) =>
+      runCli(script, order, {
+        cwd: env.dir,
+        env: buildFakeEnv(env, { FAKE_COLLAPSE_SPACES: '1', FAKE_DIAGNOSTICS_DELAY_MS: '300', FAKE_LOG: logs[i] }),
+        timeoutMs: 60000,
+      })
+    )
+  );
+  for (const r of results) {
+    assert.strictEqual(r.stderr, '');
+    assert.strictEqual(r.code, 0);
+  }
+  // One call formats each file, and the other then finds it done.
+  const lines = results.flatMap((r) => r.stdout.split('\n').filter(Boolean));
+  for (const p of paths) {
+    assert.deepStrictEqual(lines.filter((l) => l.endsWith(` ${p}`)).sort(), [`formatted: ${p}`, `unchanged: ${p}`]);
+  }
+  for (const log of logs) assertOpenedUnderLock(log);
 });

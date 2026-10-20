@@ -19,14 +19,19 @@
  *   FAKE_ERROR_MARKER=<text>            report one error for a document whose text holds <text>
  *                                       (when the diagnostics are published)
  *   FAKE_COLLAPSE_SPACES=1              formatting replaces each run of spaces with one space
+ *   FAKE_FORMATTING_DELAY_MS=<ms>       answer textDocument/formatting <ms> late
  *   FAKE_LOG=<file>                     append one line per start, per request, and per
- *                                       didOpen/didClose (`open <uri> <ms>`, `close <uri> <ms>`)
+ *                                       didOpen/didClose (`open <uri> <ms>`, `close <uri> <ms>`);
+ *                                       on didOpen also `lock <uri> held|missing|other`: whether the
+ *                                       client (the processId of initialize) holds the file's lock
+ *                                       under KIRO_JAVA_FORMAT_CACHE
  */
 
 const fs = require('fs');
 const net = require('net');
 const path = require('path');
 const crypto = require('crypto');
+const { fileURLToPath } = require('url');
 
 const argv = process.argv.slice(2);
 const userdirIndex = argv.indexOf('--userdir');
@@ -46,7 +51,26 @@ function parseRule(value) {
 const noReply = parseRule(env.FAKE_NO_REPLY);
 const exitOn = parseRule(env.FAKE_EXIT_ON);
 const diagnosticsDelayMs = parseInt(env.FAKE_DIAGNOSTICS_DELAY_MS || '30', 10);
+const formattingDelayMs = parseInt(env.FAKE_FORMATTING_DELAY_MS || '0', 10);
 const lockFile = userdir ? path.join(userdir, 'lock') : null;
+// The pid of the CLI, from `initialize`.
+let clientPid = null;
+
+/**
+ * Whether the client holds the lock of the file at `uri`, by the CLI's rule:
+ * `<cache>/locks/<sha256(realpath)[:16]>.lock` holding the CLI's pid.
+ */
+function inspectFileLock(uri) {
+  if (!env.KIRO_JAVA_FORMAT_CACHE) return 'missing';
+  let record;
+  try {
+    const key = crypto.createHash('sha256').update(fs.realpathSync(fileURLToPath(uri))).digest('hex').slice(0, 16);
+    record = JSON.parse(fs.readFileSync(path.join(env.KIRO_JAVA_FORMAT_CACHE, 'locks', `${key}.lock`), 'utf8'));
+  } catch {
+    return 'missing';
+  }
+  return record.pid === clientPid ? 'held' : 'other';
+}
 
 function removeLock() {
   if (lockFile) {
@@ -138,10 +162,12 @@ function handle(socket, msg) {
   if (msg.method === 'textDocument/didOpen' || msg.method === 'textDocument/didClose') {
     const kind = msg.method === 'textDocument/didOpen' ? 'open' : 'close';
     log(`${kind} ${msg.params.textDocument.uri} ${Date.now()}`);
+    if (kind === 'open' && env.FAKE_LOG) log(`lock ${msg.params.textDocument.uri} ${inspectFileLock(msg.params.textDocument.uri)}`);
   }
   if (/^textDocument\/did(Open|Change|Close)$/.test(msg.method)) updateDocuments(msg);
   switch (msg.method) {
     case 'initialize':
+      clientPid = msg.params.processId;
       send(socket, { id: msg.id, result: { capabilities: { documentFormattingProvider: true } } });
       return;
     case 'initialized':
@@ -157,9 +183,12 @@ function handle(socket, msg) {
         send(socket, { method: 'textDocument/publishDiagnostics', params: { uri, diagnostics: listDiagnostics(uri) } });
       }, diagnosticsDelayMs);
       return;
-    case 'textDocument/formatting':
-      send(socket, { id: msg.id, result: buildFormattingEdits(msg.params.textDocument.uri) });
+    case 'textDocument/formatting': {
+      const reply = { id: msg.id, result: buildFormattingEdits(msg.params.textDocument.uri) };
+      if (formattingDelayMs > 0) setTimeout(() => send(socket, reply), formattingDelayMs);
+      else send(socket, reply);
       return;
+    }
     case 'shutdown':
       send(socket, { id: msg.id, result: null });
       return;
