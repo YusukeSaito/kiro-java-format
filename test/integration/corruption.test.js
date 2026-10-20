@@ -257,7 +257,8 @@ describe('corruption', { skip }, () => {
             const expectedLines = [...want, ...second].sort();
             const got = lines.filter((l) => l.endsWith(`<ROOT>/${rel}`)).sort();
             if (JSON.stringify(got) !== JSON.stringify(expectedLines)) {
-              problems.push(`round ${round} ${rel}: lines ${JSON.stringify(got)}, expected ${JSON.stringify(expectedLines)}`);
+              const shown = `lines ${JSON.stringify(got)}, expected ${JSON.stringify(expectedLines)}`;
+              problems.push(`round ${round} ${rel}: ${shown}`);
             }
           }
           problems.push(...compareContents(`round ${round}`, expected.contents, copy));

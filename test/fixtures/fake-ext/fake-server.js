@@ -161,8 +161,9 @@ function handle(socket, msg) {
   }
   if (msg.method === 'textDocument/didOpen' || msg.method === 'textDocument/didClose') {
     const kind = msg.method === 'textDocument/didOpen' ? 'open' : 'close';
-    log(`${kind} ${msg.params.textDocument.uri} ${Date.now()}`);
-    if (kind === 'open' && env.FAKE_LOG) log(`lock ${msg.params.textDocument.uri} ${inspectFileLock(msg.params.textDocument.uri)}`);
+    const uri = msg.params.textDocument.uri;
+    log(`${kind} ${uri} ${Date.now()}`);
+    if (kind === 'open' && env.FAKE_LOG) log(`lock ${uri} ${inspectFileLock(uri)}`);
   }
   if (/^textDocument\/did(Open|Change|Close)$/.test(msg.method)) updateDocuments(msg);
   switch (msg.method) {
