@@ -2034,7 +2034,7 @@ class ServerSession {
     const rootUri = pathToFileURL(rootDir).href;
     const initResult = await client.request('initialize', {
       processId: process.pid,
-      clientInfo: { name: 'kiro-java-format', version: '1.2.0' },
+      clientInfo: { name: 'kiro-java-format', version: '1.3.0' },
       locale: 'en',
       rootPath: rootDir,
       rootUri,
