@@ -132,16 +132,15 @@ function vlog(...args) {
 
 /**
  * How long to wait for the server to report that a file resolves, before
- * organizing its imports. The first file pays for the project load; later files
+ * organizing its imports, counted from the file's turn (see
+ * waitForResolution). The first file pays for the project load; later files
  * are answered immediately.
  */
 const RESOLVE_WAIT_MS = 60000;
 /**
  * How many files of a call are open in the server at once: the one whose turn
  * it is and those opened ahead of it (see formatSegmentAhead). It keeps a call
- * over hundreds of files from opening them all, and the last ones opened from
- * spending much of RESOLVE_WAIT_MS, which counts from the open, before their
- * turn: the server computes the diagnostics of about two files a second.
+ * over hundreds of files from opening them all at once.
  */
 const OPEN_AHEAD_MAX = 16;
 /**
@@ -1805,13 +1804,16 @@ function selectEntryAfterRequest(entry, freshRequest) {
  * - `entry`: the latest diagnostics for the document since it was opened
  *   (`{ errorCount, arrivedAtMs }`), or null
  * - `indexPhase`: `{ kind: 'indexing' }` or `{ kind: 'complete', completionCount, completedAtMs }`
- * - `capMs`: the longest wait, counted from `openedAtMs`
+ * - `limitAtMs`: when the wait ends at the latest, or null while it has no
+ *   limit yet (a file opened ahead whose turn has not come; see
+ *   waitForResolution)
  * - `settleMs`: how long errors must stay unchanged after indexing
  *
  * Returns `{ kind: 'resolved' }`, `{ kind: 'unresolved', reason }` (reason
  * 'errors after indexing' or 'wait limit'), or `{ kind: 'pending', wakeAtMs,
  * shouldRequestFreshDiagnostics }`, where `wakeAtMs` is when the answer can
- * change with time alone (the limit, when nothing earlier).
+ * change with time alone (the limit, when nothing earlier), or null when
+ * time alone cannot change it (no limit yet, and nothing to wait out).
  */
 function decideResolution({
   entry,
@@ -1819,16 +1821,14 @@ function decideResolution({
   isPersistentUserdir,
   completionCountAtOpen,
   freshRequest,
-  openedAtMs,
   nowMs,
-  capMs,
+  limitAtMs,
   settleMs,
 }) {
-  const capAtMs = openedAtMs + capMs;
-  const pending = (wakeAtMs = capAtMs) => ({ kind: 'pending', wakeAtMs, shouldRequestFreshDiagnostics: false });
+  const pending = (wakeAtMs = limitAtMs) => ({ kind: 'pending', wakeAtMs, shouldRequestFreshDiagnostics: false });
 
   // At the limit, the latest result decides. (A NaN limit counts as reached.)
-  if (!(nowMs < capAtMs)) {
+  if (limitAtMs !== null && !(nowMs < limitAtMs)) {
     return entry !== null && entry.errorCount === 0
       ? { kind: 'resolved' }
       : { kind: 'unresolved', reason: 'wait limit' };
@@ -1844,7 +1844,7 @@ function decideResolution({
     isPersistentUserdir && indexPhase.kind === 'complete' && completionCountAtOpen !== indexPhase.completionCount;
   if (isOpenedBeforeCompletion) {
     if (freshRequest === null || freshRequest.completionCount !== indexPhase.completionCount) {
-      return { kind: 'pending', wakeAtMs: capAtMs, shouldRequestFreshDiagnostics: true };
+      return { kind: 'pending', wakeAtMs: limitAtMs, shouldRequestFreshDiagnostics: true };
     }
     const fresh = selectEntryAfterRequest(entry, freshRequest);
     if (fresh === null) return pending();
@@ -2194,19 +2194,32 @@ class ServerSession {
   }
 
   /**
-   * Wait until it is clear whether the open document resolves; resolves to
-   * `{ isResolved, reason }`.
+   * Start waiting until it is clear whether the open document resolves.
+   * Returns `{ result, startLimit }`: `result` resolves to `{ isResolved,
+   * reason }`, and `startLimit()` starts the wait's limit.
    *
    * This is the gate for organizing imports. The server rebuilds the import
    * block from the types it can resolve, so running it while the classpath is
    * still loading deletes every import it cannot see. The decision itself is
    * decideResolution; this re-evaluates it whenever diagnostics for the
    * document arrive, the indexing state changes, or the time it named passes.
+   *
+   * The wait ends at the latest `capMs` after startLimit() is called, and
+   * has no limit before that. It is called at the file's turn
+   * (organizeAndFormatOpenedFile), so a file opened ahead of its turn has the
+   * whole limit from its turn on, as a file opened at its turn has it from
+   * the open. What the server reported before the turn still counts: the
+   * wait can end before the turn.
    */
   waitForResolution(doc, capMs) {
-    return new Promise((resolve, reject) => {
+    // Set by the executor below, which runs at once.
+    let startLimit;
+    const result = new Promise((resolve, reject) => {
       let timer = null;
+      let limitAtMs = null;
+      let isFinished = false;
       const stop = () => {
+        isFinished = true;
         clearTimeout(timer);
         this.events.removeListener('diagnostics', onDiagnostics);
         this.events.removeListener('indexPhase', evaluate);
@@ -2225,9 +2238,8 @@ class ServerSession {
           isPersistentUserdir: this.isPersistentUserdir,
           completionCountAtOpen: doc.completionCountAtOpen,
           freshRequest: doc.freshRequest,
-          openedAtMs: doc.openedAtMs,
           nowMs,
-          capMs,
+          limitAtMs,
           settleMs: POST_INDEX_SETTLE_MS,
         });
         if (decision.kind === 'pending' && decision.shouldRequestFreshDiagnostics) {
@@ -2238,7 +2250,8 @@ class ServerSession {
         }
         if (decision.kind === 'pending') {
           clearTimeout(timer);
-          timer = setTimeout(evaluate, Math.max(0, decision.wakeAtMs - nowMs));
+          timer = null;
+          if (decision.wakeAtMs !== null) timer = setTimeout(evaluate, Math.max(0, decision.wakeAtMs - nowMs));
           return;
         }
         stop();
@@ -2256,7 +2269,13 @@ class ServerSession {
       this.events.on('indexPhase', evaluate);
       this.events.on('exit', evaluate);
       evaluate();
+      startLimit = () => {
+        if (isFinished) return;
+        limitAtMs = Math.max(doc.openedAtMs, Date.now()) + capMs;
+        evaluate();
+      };
     });
+    return { result, startLimit };
   }
 
   /**
@@ -2477,21 +2496,22 @@ async function organizeAndFormatFile(session, file, opts) {
  * itself; organizeAndFormatOpenedFile takes its result. Throws when the file
  * cannot be read; the lock is the caller's to release then.
  *
- * Returns `{ file, lock, original, doc, resolution }`, where `resolution` is
- * the wait, or null with --no-organize-imports.
+ * Returns `{ file, lock, original, doc, resolutionWait }`, where
+ * `resolutionWait` is what waitForResolution returns (its limit not started
+ * yet), or null with --no-organize-imports.
  */
 function readAndOpenFile(session, file, lock, opts) {
   const uri = pathToFileURL(file).href;
   const original = fs.readFileSync(file, 'utf8');
   const doc = session.openDocument(uri, original);
-  let resolution = null;
+  let resolutionWait = null;
   if (opts.organizeImports) {
-    resolution = session.waitForResolution(doc, Math.min(RESOLVE_WAIT_MS, opts.timeoutMs));
+    resolutionWait = session.waitForResolution(doc, Math.min(RESOLVE_WAIT_MS, opts.timeoutMs));
     // Until organizeAndFormatOpenedFile awaits it, a rejection (the server
     // exited) must not count as unhandled: that would end the run at once.
-    resolution.catch(() => {});
+    resolutionWait.result.catch(() => {});
   }
-  return { file, lock, original, doc, resolution };
+  return { file, lock, original, doc, resolutionWait };
 }
 
 /**
@@ -2556,7 +2576,9 @@ async function organizeAndFormatOpenedFile(session, opened, opts) {
   let doc = opened.doc;
   try {
     if (opts.organizeImports) {
-      const resolution = await opened.resolution;
+      // This file's turn: its wait's limit counts from now (see waitForResolution).
+      opened.resolutionWait.startLimit();
+      const resolution = await opened.resolutionWait.result;
       if (resolution.isResolved) {
         const organized = await session.organizeImports(doc, current, opts.timeoutMs);
         if (organized !== current) {
@@ -2636,7 +2658,8 @@ function closeFileOpenedAhead(session, ahead) {
  * resolves, so up to OPEN_AHEAD_MAX files, from the current one on, are opened
  * ahead of their turn and waited on together; after each file the window
  * moves on. Organizing, formatting, writing and printing still go one file at
- * a time, in argument order.
+ * a time, in argument order. The limit of a file's wait still counts from its
+ * turn (see waitForResolution).
  *
  * A file is open only while this call holds its lock, and the window stops at
  * the first file openFileAhead does not open: the files after it wait until it

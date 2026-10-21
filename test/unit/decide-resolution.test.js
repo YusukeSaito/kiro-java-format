@@ -24,9 +24,8 @@ function decide(overrides) {
     isPersistentUserdir: false,
     completionCountAtOpen: 0,
     freshRequest: null,
-    openedAtMs: OPENED,
     nowMs: OPENED,
-    capMs: CAP,
+    limitAtMs: OPENED + CAP,
     settleMs: SETTLE,
     ...overrides,
   });
@@ -94,7 +93,23 @@ test('at the limit the latest result decides', () => {
     reason: 'wait limit',
   });
   assert.deepStrictEqual(decide({ nowMs }), { kind: 'unresolved', reason: 'wait limit' });
-  assert.deepStrictEqual(decide({ capMs: NaN }), { kind: 'unresolved', reason: 'wait limit' });
+  assert.deepStrictEqual(decide({ limitAtMs: NaN }), { kind: 'unresolved', reason: 'wait limit' });
+});
+
+test('with no limit yet (before the turn), nothing ends at a limit; the results still decide', () => {
+  const noLimit = { limitAtMs: null, nowMs: OPENED + 10 * CAP };
+  assert.deepStrictEqual(decide({ ...noLimit, entry: { errorCount: 4, arrivedAtMs: 2000 } }), pendingUntil(null));
+  assert.deepStrictEqual(decide(noLimit), pendingUntil(null));
+  assert.deepStrictEqual(decide({ ...noLimit, entry: { errorCount: 0, arrivedAtMs: 2000 } }), { kind: 'resolved' });
+  const entry = { errorCount: 1, arrivedAtMs: 5000 };
+  const indexPhase = completeAt(4000);
+  assert.deepStrictEqual(decide({ limitAtMs: null, entry, indexPhase, nowMs: 5000 }), pendingUntil(5000 + SETTLE));
+  assert.deepStrictEqual(decide({ limitAtMs: null, entry, indexPhase, nowMs: 7000 }), {
+    kind: 'unresolved',
+    reason: 'errors after indexing',
+  });
+  const cached = { isPersistentUserdir: true, indexPhase: completeAt(8000, 1), limitAtMs: null, nowMs: 8000 };
+  assert.deepStrictEqual(decide(cached), { kind: 'pending', wakeAtMs: null, shouldRequestFreshDiagnostics: true });
 });
 
 const requestFresh = { kind: 'pending', wakeAtMs: OPENED + CAP, shouldRequestFreshDiagnostics: true };
