@@ -2199,7 +2199,8 @@ class ServerSession {
   /**
    * Start waiting until it is clear whether the open document resolves.
    * Returns `{ result, startLimit }`: `result` resolves to `{ isResolved,
-   * reason }`, and `startLimit()` starts the wait's limit.
+   * reason }`, and `startLimit()` starts the wait's limit (the first call
+   * does; later ones do nothing).
    *
    * This is the gate for organizing imports. The server rebuilds the import
    * block from the types it can resolve, so running it while the classpath is
@@ -2207,12 +2208,14 @@ class ServerSession {
    * decideResolution; this re-evaluates it whenever diagnostics for the
    * document arrive, the indexing state changes, or the time it named passes.
    *
-   * The wait ends at the latest `capMs` after startLimit() is called, and
-   * has no limit before that. It is called at the file's turn
-   * (organizeAndFormatFile, or formatSegmentAhead for a file opened ahead),
-   * so a file opened ahead of its turn has the whole limit from its turn on,
-   * as a file opened at its turn has it from the open. What the server
-   * reported before the turn still counts: the wait can end before the turn.
+   * The wait ends at the latest `capMs` after startLimit() is first called,
+   * and has no limit before that. It is called at the file's turn, by
+   * organizeAndFormatOpenedFile, and for a file opened ahead earlier in the
+   * turn by formatSegmentAhead, which waits on the result before it calls
+   * organizeAndFormatOpenedFile. So a file opened ahead of its turn has the
+   * whole limit from its turn on, as a file opened at its turn has it from
+   * the open. What the server reported before the turn still counts: the
+   * wait can end before the turn.
    */
   waitForResolution(doc, capMs) {
     // Set by the executor below, which runs at once.
@@ -2273,7 +2276,7 @@ class ServerSession {
       this.events.on('exit', evaluate);
       evaluate();
       startLimit = () => {
-        if (isFinished) return;
+        if (isFinished || limitAtMs !== null) return;
         limitAtMs = Math.max(doc.openedAtMs, Date.now()) + capMs;
         evaluate();
       };
@@ -2514,8 +2517,6 @@ async function organizeAndFormatFile(session, file, opts) {
     if (lock) releaseFileLock(lock);
     throw err;
   }
-  // Opened at its turn: its wait's limit counts from the open, as in v1.2.0.
-  if (opts.organizeImports) opened.resolutionWait.startLimit();
   return organizeAndFormatOpenedFile(session, opened, opts);
 }
 
@@ -2603,8 +2604,9 @@ function isSameFileIdentity(a, b) {
  * could be made or the wait hit its limit; writeFileIfUnchanged still guards
  * the write. A file opened ahead always has its lock.
  *
- * The limit of the file's wait has been started at its turn, by
- * organizeAndFormatFile or formatSegmentAhead (see waitForResolution).
+ * This is the file's turn, so the limit of its wait is started here, unless
+ * formatSegmentAhead started it earlier in the turn (see waitForResolution).
+ * For a file opened at its turn it then counts from the open, as in v1.2.0.
  */
 async function organizeAndFormatOpenedFile(session, opened, opts) {
   const { file, original } = opened;
@@ -2612,6 +2614,7 @@ async function organizeAndFormatOpenedFile(session, opened, opts) {
   let doc = opened.doc;
   try {
     if (opts.organizeImports) {
+      opened.resolutionWait.startLimit();
       const resolution = await opened.resolutionWait.result;
       if (resolution.isResolved) {
         const organized = await session.organizeImports(doc, current, opts.timeoutMs);
