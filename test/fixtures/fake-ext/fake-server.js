@@ -18,6 +18,11 @@
  *   FAKE_DIAGNOSTICS_DELAY_MS=<ms>      publish diagnostics <ms> after didOpen/didChange (default 30)
  *   FAKE_ERROR_MARKER=<text>            report one error for a document whose text holds <text>
  *                                       (when the diagnostics are published)
+ *   FAKE_INDEXING_MS=<ms>               report indexing as a `$/progress` from `initialized` until <ms>
+ *                                       later; when it ends, publish the diagnostics of every open
+ *                                       document again
+ *   FAKE_ERROR_WHILE_INDEXING=<text>    report one error for a document whose text holds <text> while
+ *                                       that indexing runs
  *   FAKE_COLLAPSE_SPACES=1              formatting replaces each run of spaces with one space
  *   FAKE_FORMATTING_DELAY_MS=<ms>       answer textDocument/formatting <ms> late
  *   FAKE_LOG=<file>                     append one line per start, per request, and per
@@ -53,6 +58,8 @@ const exitOn = parseRule(env.FAKE_EXIT_ON);
 const diagnosticsDelayMs = parseInt(env.FAKE_DIAGNOSTICS_DELAY_MS || '30', 10);
 const formattingDelayMs = parseInt(env.FAKE_FORMATTING_DELAY_MS || '0', 10);
 const lockFile = userdir ? path.join(userdir, 'lock') : null;
+// Whether the indexing of FAKE_INDEXING_MS runs.
+let isIndexing = false;
 // The pid of the CLI, from `initialize`.
 let clientPid = null;
 
@@ -124,8 +131,26 @@ function buildFullRange(text) {
 
 function listDiagnostics(uri) {
   const text = documents.get(uri);
-  if (!env.FAKE_ERROR_MARKER || text === undefined || !text.includes(env.FAKE_ERROR_MARKER)) return [];
-  return [{ range: buildFullRange(''), severity: 1, message: 'fake error' }];
+  if (text === undefined) return [];
+  const hasMarker = (marker) => Boolean(marker) && text.includes(marker);
+  const hasError = hasMarker(env.FAKE_ERROR_MARKER) || (isIndexing && hasMarker(env.FAKE_ERROR_WHILE_INDEXING));
+  return hasError ? [{ range: buildFullRange(''), severity: 1, message: 'fake error' }] : [];
+}
+
+function publishDiagnostics(socket, uri) {
+  send(socket, { method: 'textDocument/publishDiagnostics', params: { uri, diagnostics: listDiagnostics(uri) } });
+}
+
+/** Run the indexing of FAKE_INDEXING_MS, then publish the diagnostics of the open documents again. */
+function startIndexing(socket, durationMs) {
+  const token = 'fake-indexing';
+  isIndexing = true;
+  send(socket, { method: '$/progress', params: { token, value: { kind: 'begin', title: 'Indexing' } } });
+  setTimeout(() => {
+    isIndexing = false;
+    send(socket, { method: '$/progress', params: { token, value: { kind: 'end' } } });
+    for (const uri of documents.keys()) publishDiagnostics(socket, uri);
+  }, durationMs);
 }
 
 function buildFormattingEdits(uri) {
@@ -172,6 +197,7 @@ function handle(socket, msg) {
       send(socket, { id: msg.id, result: { capabilities: { documentFormattingProvider: true } } });
       return;
     case 'initialized':
+      if (env.FAKE_INDEXING_MS) startIndexing(socket, parseInt(env.FAKE_INDEXING_MS, 10));
       if (env.FAKE_NO_INDEXING_MESSAGE !== '1') {
         const params = { type: 3, message: 'Indexing completed.' };
         setTimeout(() => send(socket, { method: 'window/showMessage', params }), 20);
@@ -179,10 +205,7 @@ function handle(socket, msg) {
       return;
     case 'textDocument/didOpen':
     case 'textDocument/didChange':
-      setTimeout(() => {
-        const uri = msg.params.textDocument.uri;
-        send(socket, { method: 'textDocument/publishDiagnostics', params: { uri, diagnostics: listDiagnostics(uri) } });
-      }, diagnosticsDelayMs);
+      setTimeout(() => publishDiagnostics(socket, msg.params.textDocument.uri), diagnosticsDelayMs);
       return;
     case 'textDocument/formatting': {
       const reply = { id: msg.id, result: buildFormattingEdits(msg.params.textDocument.uri) };

@@ -225,6 +225,32 @@ test('a file whose lock another run holds past --timeout is formatted without it
   assert.deepStrictEqual(fs.readdirSync(locksDir), [], 'no lock is left');
 });
 
+// v1.2.0 opens a file at its turn, so its wait limit for whether the file
+// resolves counts from the turn. Here indexing outlasts the limit
+// (--timeout 3), and the files have errors until it ends: F0, whose turn comes
+// first, reaches the limit with errors, and its imports are skipped; F1's turn
+// comes when F0's limit runs out, and indexing ends within F1's own limit, so
+// it resolves; F2 and F3 resolve once indexing ends. Opened ahead with F0,
+// they must not spend their limits before their turns.
+test('a file opened ahead counts its wait limit from its turn, as v1.2.0 does from the open', async (t) => {
+  const env = setUpEnv(t);
+  const contents = {};
+  for (let i = 0; i < 4; i++) contents[`F${i}.java`] = `class F${i} {} // NEEDS_INDEX\n`;
+  const paths = writeFiles(env.dir, contents);
+  const fake = { FAKE_INDEXING_MS: '4500', FAKE_ERROR_WHILE_INDEXING: 'NEEDS_INDEX' };
+  const r = await runCli(script, ['--timeout', '3', ...paths], {
+    cwd: env.dir,
+    env: buildFakeEnv(env, fake),
+    timeoutMs: 60000,
+  });
+  assert.strictEqual(r.stderr, '');
+  assert.strictEqual(r.code, 0);
+  assert.strictEqual(
+    r.stdout,
+    `imports skipped (file does not resolve): ${paths[0]}\n${paths.map((p) => `unchanged: ${p}\n`).join('')}`
+  );
+});
+
 test('when the server exits, the files opened ahead are closed and their locks released', async (t) => {
   const env = setUpEnv(t);
   const paths = writeJavaFiles(env.dir, 5);
