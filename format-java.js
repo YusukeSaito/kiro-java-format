@@ -1306,13 +1306,19 @@ const heldFileLocks = new Map();
  * can be made. Either way the write is still guarded by writeFileIfUnchanged.
  */
 async function acquireFileLock(file, timeoutMs) {
-  const lockPath = resolveFileLockPath(file);
-  if (lockPath === null) return null;
+  const resolved = resolveFileLockPath(file);
+  if (resolved.kind === 'unavailable') {
+    vlog(`no lock for ${file} (${resolved.reason}); continuing without the lock`);
+    return null;
+  }
   const deadlineMs = Date.now() + timeoutMs;
   for (;;) {
-    const attempt = await attemptFileLock(file, lockPath);
+    const attempt = await attemptFileLock(resolved.lockPath);
     if (attempt.kind === 'acquired') return attempt.lock;
-    if (attempt.kind === 'unavailable') return null;
+    if (attempt.kind === 'unavailable') {
+      vlog(`no lock for ${file} (${attempt.reason}); continuing without the lock`);
+      return null;
+    }
     if (hasDeadlinePassed(deadlineMs)) {
       vlog(`lock wait limit reached for ${file}; continuing without the lock`);
       return null;
@@ -1324,51 +1330,47 @@ async function acquireFileLock(file, timeoutMs) {
 /**
  * Take the lock for one file if no other run holds it, without waiting.
  * Returns `{ kind: 'acquired', lock }`, `{ kind: 'busy' }` while another run
- * holds it, or `{ kind: 'unavailable' }` when no lock can be made (the file
- * is then processed without one, as with acquireFileLock).
+ * holds it, or `{ kind: 'unavailable', reason }` when no lock can be made.
+ * Unlike acquireFileLock, this logs nothing: what follows is the caller's.
  */
 async function tryAcquireFileLock(file) {
-  const lockPath = resolveFileLockPath(file);
-  if (lockPath === null) return { kind: 'unavailable' };
-  return attemptFileLock(file, lockPath);
+  const resolved = resolveFileLockPath(file);
+  if (resolved.kind === 'unavailable') return resolved;
+  return attemptFileLock(resolved.lockPath);
 }
 
 /**
- * The lock file of `file`, named by its real path, or null when there can be
- * none (the lock directory cannot be made, or the path cannot be resolved).
+ * The lock file of `file`, named by its real path: `{ kind: 'available',
+ * lockPath }`, or `{ kind: 'unavailable', reason }` when there can be none
+ * (the lock directory cannot be made, or the path cannot be resolved).
  */
 function resolveFileLockPath(file) {
   try {
     const lockDir = ensurePrivateDir(resolveLockDir(resolveCurrentCacheRoot()));
     const key = crypto.createHash('sha256').update(fs.realpathSync(file)).digest('hex').slice(0, 16);
-    return path.join(lockDir, `${key}.lock`);
+    return { kind: 'available', lockPath: path.join(lockDir, `${key}.lock`) };
   } catch (err) {
-    vlog(`no lock for ${file} (${err.message}); continuing without the lock`);
-    return null;
+    return { kind: 'unavailable', reason: err.message };
   }
 }
 
 /**
- * One attempt at the lock of `file` at `lockPath`, breaking it first when it
- * is left over. Returns what tryAcquireFileLock returns.
+ * One attempt at the lock at `lockPath`, breaking it first when it is left
+ * over. Returns what tryAcquireFileLock returns.
  */
-async function attemptFileLock(file, lockPath) {
+async function attemptFileLock(lockPath) {
   for (;;) {
     const r = acquireLockFile(lockPath, {});
     if (r.kind === 'acquired') {
       heldFileLocks.set(lockPath, r.nonce);
       return { kind: 'acquired', lock: { lockPath, nonce: r.nonce } };
     }
-    if (r.kind === 'unusable') {
-      vlog(`no lock for ${file} (${r.reason}); continuing without the lock`);
-      return { kind: 'unavailable' };
-    }
+    if (r.kind === 'unusable') return { kind: 'unavailable', reason: r.reason };
     let read;
     try {
       read = readLockRecord(lockPath);
     } catch (err) {
-      vlog(`no lock for ${file} (${err.message}); continuing without the lock`);
-      return { kind: 'unavailable' };
+      return { kind: 'unavailable', reason: err.message };
     }
     const isBroken = (await isLockStale(read, Date.now())) && breakStaleLock(lockPath, read);
     if (!isBroken) return { kind: 'busy' };
@@ -2528,6 +2530,9 @@ function readAndOpenFile(session, file, lock, opts) {
  */
 async function openFileAhead(session, file, opts, openFiles) {
   const attempt = await tryAcquireFileLock(file);
+  // This only stops the window: at the file's turn, acquireFileLock tries
+  // again and logs how the file goes on.
+  if (attempt.kind === 'unavailable') vlog(`not opened ahead: ${file} (no lock: ${attempt.reason})`);
   if (attempt.kind !== 'acquired') return null;
   try {
     const identity = readFileIdentity(file);

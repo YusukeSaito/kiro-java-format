@@ -251,6 +251,53 @@ test('a file opened ahead counts its wait limit from its turn, as v1.2.0 does fr
   );
 });
 
+/** The lines of `stderr` that match `pattern`, with `root` written as <ROOT>. */
+function selectLines(stderr, pattern, root) {
+  return normalizeOutput(stderr, [root])
+    .split('\n')
+    .filter((line) => pattern.test(line));
+}
+
+// When no lock can be made, a file is not opened ahead, and its turn goes on
+// without the lock as in v1.2.0. Only the turn says so.
+test('without file locks, -v says "continuing without the lock" only at each turn, as v1.2.0 does', async (t) => {
+  const env = setUpEnv(t);
+  // The lock directory cannot be made where a file is.
+  fs.mkdirSync(env.KIRO_JAVA_FORMAT_CACHE, { recursive: true });
+  const locksPath = path.join(env.KIRO_JAVA_FORMAT_CACHE, 'locks');
+  fs.writeFileSync(locksPath, '');
+  const run = (scriptPath, dir) => {
+    fs.mkdirSync(dir, { recursive: true });
+    const paths = writeJavaFiles(dir, 3);
+    return runCli(scriptPath, ['-v', ...paths], { cwd: dir, env: buildFakeEnv(env), timeoutMs: 60000 });
+  };
+  const releasedDir = path.join(env.dir, 'released');
+  const currentDir = path.join(env.dir, 'current');
+  let released;
+  let current;
+  try {
+    released = await run(extractReleasedScript(path.join(env.dir, 'v120')), releasedDir);
+    current = await run(script, currentDir);
+  } finally {
+    // The leftover check of setUpEnv reads the lock directory.
+    fs.rmSync(locksPath);
+  }
+  assert.strictEqual(normalizeOutput(current.stdout, [currentDir]), normalizeOutput(released.stdout, [releasedDir]));
+  assert.strictEqual(removeVerboseLines(current.stderr), removeVerboseLines(released.stderr));
+  assert.strictEqual(current.code, released.code);
+  const withoutLock = /continuing without the lock/;
+  const releasedLines = selectLines(released.stderr, withoutLock, releasedDir);
+  assert.strictEqual(releasedLines.length, 3, released.stderr);
+  assert.deepStrictEqual(selectLines(current.stderr, withoutLock, currentDir), releasedLines);
+  // Each file is tried once ahead, at its own turn: the window stops at it.
+  const notOpened = selectLines(current.stderr, /not opened ahead: /, currentDir);
+  assert.deepStrictEqual(
+    notOpened.map((line) => line.replace(/ \(no lock: .+\)$/, ' (no lock: <reason>)')),
+    [0, 1, 2].map((i) => `[kjf] not opened ahead: <ROOT>/F${i}.java (no lock: <reason>)`),
+    current.stderr
+  );
+});
+
 test('when the server exits, the files opened ahead are closed and their locks released', async (t) => {
   const env = setUpEnv(t);
   const paths = writeJavaFiles(env.dir, 5);
