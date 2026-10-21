@@ -225,30 +225,61 @@ test('a file whose lock another run holds past --timeout is formatted without it
   assert.deepStrictEqual(fs.readdirSync(locksDir), [], 'no lock is left');
 });
 
-// v1.2.0 opens a file at its turn, so its wait limit for whether the file
-// resolves counts from the turn. Here indexing outlasts the limit
-// (--timeout 3), and the files have errors until it ends: F0, whose turn comes
-// first, reaches the limit with errors, and its imports are skipped; F1's turn
-// comes when F0's limit runs out, and indexing ends within F1's own limit, so
-// it resolves; F2 and F3 resolve once indexing ends. Opened ahead with F0,
-// they must not spend their limits before their turns.
-test('a file opened ahead counts its wait limit from its turn, as v1.2.0 does from the open', async (t) => {
-  const env = setUpEnv(t);
+/**
+ * Run `scriptPath` with --timeout 3 over F0 to F3 in `env`. Indexing completes
+ * at once, then begins again 300 ms in, before the files' first diagnostics
+ * (600 ms after each open), and lasts until 4.5 s in; the files have errors
+ * while it runs. Returns the result, the paths, and the fake server's
+ * didOpen/didClose events.
+ */
+async function runWithIndexingAgain(env, scriptPath) {
+  const log = path.join(env.dir, 'fake.log');
   const contents = {};
   for (let i = 0; i < 4; i++) contents[`F${i}.java`] = `class F${i} {} // NEEDS_INDEX\n`;
   const paths = writeFiles(env.dir, contents);
-  const fake = { FAKE_INDEXING_MS: '4500', FAKE_ERROR_WHILE_INDEXING: 'NEEDS_INDEX' };
-  const r = await runCli(script, ['--timeout', '3', ...paths], {
+  const fake = {
+    FAKE_INDEXING_AFTER_MS: '300',
+    FAKE_INDEXING_MS: '4200',
+    FAKE_ERROR_WHILE_INDEXING: 'NEEDS_INDEX',
+    FAKE_DIAGNOSTICS_DELAY_MS: '600',
+    FAKE_LOG: log,
+  };
+  const r = await runCli(scriptPath, ['--timeout', '3', ...paths], {
     cwd: env.dir,
     env: buildFakeEnv(env, fake),
     timeoutMs: 60000,
   });
-  assert.strictEqual(r.stderr, '');
-  assert.strictEqual(r.code, 0);
+  return { ...r, paths, events: readDocumentEvents(log) };
+}
+
+// v1.2.0 opens a file at its turn, so its wait limit for whether the file
+// resolves counts from the turn. Here indexing completes at once, so F1 to F3
+// are opened ahead with F0; it begins again before their first diagnostics
+// and lasts past F0's limit (--timeout 3), so every file has errors until it
+// ends. F0 reaches its limit, and its imports are skipped. F1's turn comes
+// then, and indexing ends within the limit counted from that turn, so F1
+// resolves, and F2 and F3 with it. Counted from their open, the limits of F1
+// to F3 would run out with F0's.
+test('a file opened ahead after indexing completed counts its wait limit from its turn, as v1.2.0 does', async (t) => {
+  // One environment per run: a second run in the same cache would use the
+  // cached userdir, which decides nothing while indexing runs.
+  const releasedEnv = setUpEnv(t);
+  const currentEnv = setUpEnv(t);
+  const released = await runWithIndexingAgain(releasedEnv, extractReleasedScript(path.join(releasedEnv.dir, 'v120')));
+  const current = await runWithIndexingAgain(currentEnv, script);
+  const [first] = released.paths;
   assert.strictEqual(
-    r.stdout,
-    `imports skipped (file does not resolve): ${paths[0]}\n${paths.map((p) => `unchanged: ${p}\n`).join('')}`
+    released.stdout,
+    `imports skipped (file does not resolve): ${first}\n${released.paths.map((p) => `unchanged: ${p}\n`).join('')}`,
+    'v1.2.0 skips the imports of F0 only'
   );
+  const normalize = (text, env) => normalizeOutput(text, [env.dir]);
+  assert.strictEqual(normalize(current.stdout, currentEnv), normalize(released.stdout, releasedEnv));
+  assert.strictEqual(normalize(current.stderr, currentEnv), normalize(released.stderr, releasedEnv));
+  assert.strictEqual(current.code, released.code);
+  const at = (kind, file) => current.events.find((e) => e.kind === kind && e.uri === pathToFileURL(file).href).atMs;
+  const [f0, , , f3] = current.paths;
+  assert.ok(at('open', f3) < at('close', f0), 'F1 to F3 are opened ahead, before F0 is done');
 });
 
 /** When the fake server's log says its indexing (FAKE_INDEXING_MS) ended. */

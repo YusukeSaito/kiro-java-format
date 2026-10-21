@@ -21,6 +21,8 @@
  *   FAKE_INDEXING_MS=<ms>               report indexing as a `$/progress` from `initialized` until <ms>
  *                                       later; when it ends, publish the diagnostics of every open
  *                                       document again
+ *   FAKE_INDEXING_AFTER_MS=<ms>         begin that indexing <ms> after `initialized` instead; past the
+ *                                       "Indexing completed." message (20 ms), indexing begins again
  *   FAKE_ERROR_WHILE_INDEXING=<text>    report one error for a document whose text holds <text> while
  *                                       that indexing runs
  *   FAKE_COLLAPSE_SPACES=1              formatting replaces each run of spaces with one space
@@ -58,6 +60,7 @@ const noReply = parseRule(env.FAKE_NO_REPLY);
 const exitOn = parseRule(env.FAKE_EXIT_ON);
 const diagnosticsDelayMs = parseInt(env.FAKE_DIAGNOSTICS_DELAY_MS || '30', 10);
 const formattingDelayMs = parseInt(env.FAKE_FORMATTING_DELAY_MS || '0', 10);
+const indexingAfterMs = parseInt(env.FAKE_INDEXING_AFTER_MS || '0', 10);
 const lockFile = userdir ? path.join(userdir, 'lock') : null;
 // Whether the indexing of FAKE_INDEXING_MS runs.
 let isIndexing = false;
@@ -199,7 +202,11 @@ function handle(socket, msg) {
       send(socket, { id: msg.id, result: { capabilities: { documentFormattingProvider: true } } });
       return;
     case 'initialized':
-      if (env.FAKE_INDEXING_MS) startIndexing(socket, parseInt(env.FAKE_INDEXING_MS, 10));
+      if (env.FAKE_INDEXING_MS) {
+        const durationMs = parseInt(env.FAKE_INDEXING_MS, 10);
+        if (indexingAfterMs > 0) setTimeout(() => startIndexing(socket, durationMs), indexingAfterMs);
+        else startIndexing(socket, durationMs);
+      }
       if (env.FAKE_NO_INDEXING_MESSAGE !== '1') {
         const params = { type: 3, message: 'Indexing completed.' };
         setTimeout(() => send(socket, { method: 'window/showMessage', params }), 20);
