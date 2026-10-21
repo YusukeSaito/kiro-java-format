@@ -1913,9 +1913,10 @@ class ServerSession {
     // 'diagnostics' (uri), 'indexPhase', 'exit'
     this.events = new EventEmitter();
     // Each document waiting in waitForResolution listens to every event, and
-    // up to OPEN_AHEAD_MAX wait at once. Node's warning past that limit still
+    // up to OPEN_AHEAD_MAX wait at once; waitForDecisionOrCompletion adds one
+    // more 'indexPhase' listener. Node's warning past that limit still
     // reports a wait that never removed its listeners.
-    this.events.setMaxListeners(OPEN_AHEAD_MAX);
+    this.events.setMaxListeners(OPEN_AHEAD_MAX + 1);
     // Some code actions push their result instead of returning it. Keep the
     // last pushed edit so the organize-imports step can pick it up.
     this.pushedEdit = null;
@@ -2208,10 +2209,10 @@ class ServerSession {
    *
    * The wait ends at the latest `capMs` after startLimit() is called, and
    * has no limit before that. It is called at the file's turn
-   * (organizeAndFormatOpenedFile), so a file opened ahead of its turn has the
-   * whole limit from its turn on, as a file opened at its turn has it from
-   * the open. What the server reported before the turn still counts: the
-   * wait can end before the turn.
+   * (organizeAndFormatFile, or formatSegmentAhead for a file opened ahead),
+   * so a file opened ahead of its turn has the whole limit from its turn on,
+   * as a file opened at its turn has it from the open. What the server
+   * reported before the turn still counts: the wait can end before the turn.
    */
   waitForResolution(doc, capMs) {
     // Set by the executor below, which runs at once.
@@ -2278,6 +2279,31 @@ class ServerSession {
       };
     });
     return { result, startLimit };
+  }
+
+  /**
+   * Wait until `decision` (the result of a waitForResolution) settles, or
+   * until indexing has completed more than `completionCount` times, whichever
+   * comes first. Resolves to 'decided' or 'completed' (at once when such a
+   * completion came already); never rejects: the decision's own rejection is
+   * for whoever awaits the decision.
+   */
+  waitForDecisionOrCompletion(decision, completionCount) {
+    if (this.completionCount !== completionCount) return Promise.resolve('completed');
+    return new Promise((resolve) => {
+      const finish = (kind) => {
+        this.events.removeListener('indexPhase', onIndexPhase);
+        resolve(kind);
+      };
+      const onIndexPhase = () => {
+        if (this.completionCount !== completionCount) finish('completed');
+      };
+      this.events.on('indexPhase', onIndexPhase);
+      decision.then(
+        () => finish('decided'),
+        () => finish('decided')
+      );
+    });
   }
 
   /**
@@ -2488,6 +2514,8 @@ async function organizeAndFormatFile(session, file, opts) {
     if (lock) releaseFileLock(lock);
     throw err;
   }
+  // Opened at its turn: its wait's limit counts from the open, as in v1.2.0.
+  if (opts.organizeImports) opened.resolutionWait.startLimit();
   return organizeAndFormatOpenedFile(session, opened, opts);
 }
 
@@ -2574,6 +2602,9 @@ function isSameFileIdentity(a, b) {
  * A file opened at its turn has no lock (`opened.lock` is null) when none
  * could be made or the wait hit its limit; writeFileIfUnchanged still guards
  * the write. A file opened ahead always has its lock.
+ *
+ * The limit of the file's wait has been started at its turn, by
+ * organizeAndFormatFile or formatSegmentAhead (see waitForResolution).
  */
 async function organizeAndFormatOpenedFile(session, opened, opts) {
   const { file, original } = opened;
@@ -2581,8 +2612,6 @@ async function organizeAndFormatOpenedFile(session, opened, opts) {
   let doc = opened.doc;
   try {
     if (opts.organizeImports) {
-      // This file's turn: its wait's limit counts from now (see waitForResolution).
-      opened.resolutionWait.startLimit();
       const resolution = await opened.resolutionWait.result;
       if (resolution.isResolved) {
         const organized = await session.organizeImports(doc, current, opts.timeoutMs);
@@ -2660,12 +2689,18 @@ function closeFileOpenedAhead(session, ahead) {
  * comes.
  *
  * Most of a file's time goes to waiting for the server to tell whether it
- * resolves, so up to OPEN_AHEAD_MAX files, from the current one on, are opened
- * ahead of their turn and waited on together; after each file the window
- * moves on. Organizing, formatting, writing and printing still go one file at
- * a time, in argument order. The limit of a file's wait still counts from its
- * turn (see waitForResolution). Without that wait (--no-organize-imports),
- * formatFiles uses formatSegmentFileByFile instead.
+ * resolves, so once indexing is complete, up to OPEN_AHEAD_MAX files, from the
+ * current one on, are opened ahead of their turn and waited on together; after
+ * each file the window moves on. Organizing, formatting, writing and printing
+ * still go one file at a time, in argument order. The limit of a file's wait
+ * still counts from its turn (see waitForResolution). Without that wait
+ * (--no-organize-imports), formatFiles uses formatSegmentFileByFile instead.
+ *
+ * While indexing runs, only the turn's file is open, as in v1.2.0: a file
+ * opened ahead then would hold its lock through the waits of the turns before
+ * its own, each up to the limit. When indexing completes while the turn's file
+ * waits, the window is filled then. It is only ever filled here, in the loop:
+ * at the start of a turn, and while the turn's file (opened ahead) waits.
  *
  * A file is open only while this call holds its lock, and the window stops at
  * the first file openFileAhead does not open: the files after it wait until it
@@ -2678,27 +2713,52 @@ function closeFileOpenedAhead(session, ahead) {
  * closed and their locks released.
  */
 async function formatSegmentAhead(session, segment, opts, onStart) {
-  // The files opened ahead whose turn has not come, by their index in
-  // `segment`: always the indexes from the current turn up to `nextIndex`.
+  // The files opened ahead that are not done, by their index in `segment`:
+  // always the indexes from the current turn up to `nextIndex`. The turn's
+  // file stays here until it is decided whether it resolves.
   const openedAhead = new Map();
   let nextIndex = 0;
   let exitCode = 0;
+  // The end of the window at turn `i`: OPEN_AHEAD_MAX files once indexing is
+  // complete, else only the turn's own file.
+  const resolveWindowEnd = (i) =>
+    session.indexPhase.kind === 'complete' ? Math.min(segment.length, i + OPEN_AHEAD_MAX) : i + 1;
+  // Open files ahead from `nextIndex` up to the end of the window, and stop at
+  // the first one openFileAhead does not open.
+  const fillWindow = async (i) => {
+    while (nextIndex < resolveWindowEnd(i)) {
+      const opened = await openFileAhead(session, segment[nextIndex], opts, [...openedAhead.values()]);
+      if (!opened) return;
+      openedAhead.set(nextIndex, opened);
+      nextIndex++;
+    }
+  };
   try {
     for (let i = 0; i < segment.length; i++) {
       nextIndex = Math.max(nextIndex, i);
-      while (nextIndex < Math.min(segment.length, i + OPEN_AHEAD_MAX)) {
-        const opened = await openFileAhead(session, segment[nextIndex], opts, [...openedAhead.values()]);
-        if (!opened) break;
-        openedAhead.set(nextIndex, opened);
-        nextIndex++;
-      }
+      // Taken before each fill, so that a completion after the fill's last
+      // look at the indexing state is not missed.
+      let completionCount = session.completionCount;
+      await fillWindow(i);
       onStart(segment[i]);
       const ahead = openedAhead.get(i);
+      if (!ahead) {
+        // Not opened ahead: the window is empty, so no lock is held while
+        // this file's lock is waited for.
+        exitCode = Math.max(exitCode, await organizeAndFormatFile(session, segment[i], opts));
+        continue;
+      }
+      if (opts.organizeImports) {
+        // Its turn: its wait's limit counts from now (see waitForResolution).
+        ahead.resolutionWait.startLimit();
+        const decision = ahead.resolutionWait.result;
+        while ((await session.waitForDecisionOrCompletion(decision, completionCount)) === 'completed') {
+          completionCount = session.completionCount;
+          await fillWindow(i);
+        }
+      }
       openedAhead.delete(i);
-      const code = ahead
-        ? await organizeAndFormatOpenedFile(session, ahead, opts)
-        : await organizeAndFormatFile(session, segment[i], opts);
-      exitCode = Math.max(exitCode, code);
+      exitCode = Math.max(exitCode, await organizeAndFormatOpenedFile(session, ahead, opts));
     }
   } finally {
     for (const ahead of openedAhead.values()) closeFileOpenedAhead(session, ahead);
