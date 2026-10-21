@@ -2689,15 +2689,15 @@ function closeFileOpenedAhead(session, ahead) {
 /**
  * Organize, format and write the files of one segment in order, and return
  * the largest of their exit codes. `onStart(file)` runs as each file's turn
- * comes.
+ * comes. Only for organizing imports (`opts.organizeImports`): with
+ * --no-organize-imports, formatFiles uses formatSegmentFileByFile instead.
  *
  * Most of a file's time goes to waiting for the server to tell whether it
  * resolves, so once indexing is complete, up to OPEN_AHEAD_MAX files, from the
  * current one on, are opened ahead of their turn and waited on together; after
  * each file the window moves on. Organizing, formatting, writing and printing
  * still go one file at a time, in argument order. The limit of a file's wait
- * still counts from its turn (see waitForResolution). Without that wait
- * (--no-organize-imports), formatFiles uses formatSegmentFileByFile instead.
+ * still counts from its turn (see waitForResolution).
  *
  * While indexing runs, only the turn's file is open, as in v1.2.0: a file
  * opened ahead then would hold its lock through the waits of the turns before
@@ -2751,14 +2751,12 @@ async function formatSegmentAhead(session, segment, opts, onStart) {
         exitCode = Math.max(exitCode, await organizeAndFormatFile(session, segment[i], opts));
         continue;
       }
-      if (opts.organizeImports) {
-        // Its turn: its wait's limit counts from now (see waitForResolution).
-        ahead.resolutionWait.startLimit();
-        const decision = ahead.resolutionWait.result;
-        while ((await session.waitForDecisionOrCompletion(decision, completionCount)) === 'completed') {
-          completionCount = session.completionCount;
-          await fillWindow(i);
-        }
+      // Its turn: its wait's limit counts from now (see waitForResolution).
+      ahead.resolutionWait.startLimit();
+      const decision = ahead.resolutionWait.result;
+      while ((await session.waitForDecisionOrCompletion(decision, completionCount)) === 'completed') {
+        completionCount = session.completionCount;
+        await fillWindow(i);
       }
       openedAhead.delete(i);
       exitCode = Math.max(exitCode, await organizeAndFormatOpenedFile(session, ahead, opts));
