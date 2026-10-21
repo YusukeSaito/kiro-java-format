@@ -2664,7 +2664,8 @@ function closeFileOpenedAhead(session, ahead) {
  * ahead of their turn and waited on together; after each file the window
  * moves on. Organizing, formatting, writing and printing still go one file at
  * a time, in argument order. The limit of a file's wait still counts from its
- * turn (see waitForResolution).
+ * turn (see waitForResolution). Without that wait (--no-organize-imports),
+ * formatFiles uses formatSegmentFileByFile instead.
  *
  * A file is open only while this call holds its lock, and the window stops at
  * the first file openFileAhead does not open: the files after it wait until it
@@ -2701,6 +2702,22 @@ async function formatSegmentAhead(session, segment, opts, onStart) {
     }
   } finally {
     for (const ahead of openedAhead.values()) closeFileOpenedAhead(session, ahead);
+  }
+  return exitCode;
+}
+
+/**
+ * Format and write the files of one segment in order, each opened at its
+ * turn, as formatSegmentAhead does but without opening any ahead. For
+ * --no-organize-imports: no file then waits for whether it resolves, so there
+ * is no wait to share, and a file opened ahead would only hold its lock
+ * longer.
+ */
+async function formatSegmentFileByFile(session, segment, opts, onStart) {
+  let exitCode = 0;
+  for (const file of segment) {
+    onStart(file);
+    exitCode = Math.max(exitCode, await organizeAndFormatFile(session, file, opts));
   }
   return exitCode;
 }
@@ -2762,7 +2779,8 @@ async function formatFiles(files, context) {
       let indexing = null;
       let indexingEndedAtMs = null;
       await runWithServerSession(context, lease, async (session) => {
-        const code = await formatSegmentAhead(session, segment, context.opts, () => notStarted.shift());
+        const formatSegment = context.opts.organizeImports ? formatSegmentAhead : formatSegmentFileByFile;
+        const code = await formatSegment(session, segment, context.opts, () => notStarted.shift());
         exitCode = Math.max(exitCode, code);
         const nowMs = Date.now();
         indexing = session.measureIndexingTime(nowMs);

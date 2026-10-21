@@ -298,6 +298,50 @@ test('without file locks, -v says "continuing without the lock" only at each tur
   );
 });
 
+/**
+ * Run `scriptPath` with --no-organize-imports over six files in `dir`, half
+ * of which the fake server reformats. Returns the result, the paths, their
+ * contents afterwards, and the most documents the server held open at once.
+ */
+async function runWithoutOrganizeImports(env, scriptPath, dir) {
+  const contents = {};
+  for (let i = 0; i < 6; i++) contents[`F${i}.java`] = i % 2 === 0 ? `class   F${i} {}\n` : `class F${i} {}\n`;
+  const paths = writeFiles(dir, contents);
+  const log = path.join(dir, 'fake.log');
+  const r = await runCli(scriptPath, ['--no-organize-imports', ...paths], {
+    cwd: dir,
+    env: buildFakeEnv(env, { FAKE_COLLAPSE_SPACES: '1', FAKE_LOG: log }),
+    timeoutMs: 60000,
+  });
+  return {
+    ...r,
+    paths,
+    contents: paths.map((p) => fs.readFileSync(p, 'utf8')),
+    maxOpen: countMaxOpenDocuments(readDocumentEvents(log)),
+  };
+}
+
+// Without organizing imports no file waits for whether it resolves, so
+// nothing is opened ahead: each file is opened at its turn, as in v1.2.0.
+test('with --no-organize-imports, one file is open at a time and the output is that of v1.2.0', async (t) => {
+  const env = setUpEnv(t);
+  const releasedDir = path.join(env.dir, 'released');
+  const currentDir = path.join(env.dir, 'current');
+  const released = await runWithoutOrganizeImports(env, extractReleasedScript(path.join(env.dir, 'v120')), releasedDir);
+  const current = await runWithoutOrganizeImports(env, script, currentDir);
+  assert.strictEqual(
+    released.stdout,
+    released.paths.map((p, i) => `${i % 2 === 0 ? 'formatted' : 'unchanged'}: ${p}\n`).join(''),
+    'v1.2.0 formats the files with runs of spaces'
+  );
+  assert.strictEqual(released.maxOpen, 1, 'v1.2.0 opens one file at a time');
+  assert.strictEqual(normalizeOutput(current.stdout, [currentDir]), normalizeOutput(released.stdout, [releasedDir]));
+  assert.strictEqual(normalizeOutput(current.stderr, [currentDir]), normalizeOutput(released.stderr, [releasedDir]));
+  assert.strictEqual(current.code, released.code);
+  assert.deepStrictEqual(current.contents, released.contents);
+  assert.strictEqual(current.maxOpen, 1, 'one document is open at a time');
+});
+
 test('when the server exits, the files opened ahead are closed and their locks released', async (t) => {
   const env = setUpEnv(t);
   const paths = writeJavaFiles(env.dir, 5);
