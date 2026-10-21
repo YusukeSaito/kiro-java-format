@@ -251,6 +251,43 @@ test('a file opened ahead counts its wait limit from its turn, as v1.2.0 does fr
   );
 });
 
+/** When the fake server's log says its indexing (FAKE_INDEXING_MS) ended. */
+function readIndexedAtMs(logFile) {
+  const m = fs.readFileSync(logFile, 'utf8').match(/^indexed (\d+)$/m);
+  if (!m) throw new Error(`no indexing end in ${logFile}`);
+  return Number(m[1]);
+}
+
+// A file opened ahead while indexing runs would hold its lock through the
+// waits of the turns before its own, so only the turn's file is open then.
+// F0 and F1 resolve at once; F2 has errors until indexing ends, so indexing
+// completes while F2 waits: the rest is opened then, before F2 is done.
+test("while indexing runs only the turn's file is open, and the window fills once it completes", async (t) => {
+  const env = setUpEnv(t);
+  const log = path.join(env.dir, 'fake.log');
+  const contents = {};
+  for (let i = 0; i < 8; i++) contents[`F${i}.java`] = i === 2 ? `class F${i} {} // NEEDS_INDEX\n` : `class F${i} {}\n`;
+  const paths = writeFiles(env.dir, contents);
+  const fake = { FAKE_INDEXING_MS: '1500', FAKE_ERROR_WHILE_INDEXING: 'NEEDS_INDEX', FAKE_LOG: log };
+  const r = await runCli(script, paths, { cwd: env.dir, env: buildFakeEnv(env, fake), timeoutMs: 60000 });
+  assert.strictEqual(r.stderr, '');
+  assert.strictEqual(r.code, 0);
+  assert.strictEqual(r.stdout, paths.map((p) => `unchanged: ${p}\n`).join(''));
+  const events = readDocumentEvents(log);
+  const indexedAtMs = readIndexedAtMs(log);
+  const at = (kind, file) => events.find((e) => e.kind === kind && e.uri === pathToFileURL(file).href).atMs;
+  assert.ok(at('open', paths[2]) < indexedAtMs, 'F2 is opened while indexing runs');
+  assert.strictEqual(
+    countMaxOpenDocuments(events.filter((e) => e.atMs < indexedAtMs)),
+    1,
+    'one file is open at a time while indexing runs'
+  );
+  assert.ok(at('open', paths[3]) >= indexedAtMs, 'F3 is opened once indexing has completed');
+  assert.ok(at('open', paths[7]) < at('close', paths[2]), 'F3 to F7 are opened while F2 waits');
+  assert.strictEqual(countMaxOpenDocuments(events), 6, 'F2 and the five files after it are open at once');
+  assertOpenedUnderLock(log);
+});
+
 /** The lines of `stderr` that match `pattern`, with `root` written as <ROOT>. */
 function selectLines(stderr, pattern, root) {
   return normalizeOutput(stderr, [root])

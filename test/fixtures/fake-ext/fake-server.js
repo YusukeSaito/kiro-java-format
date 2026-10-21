@@ -29,7 +29,8 @@
  *                                       didOpen/didClose (`open <uri> <ms>`, `close <uri> <ms>`);
  *                                       on didOpen also `lock <uri> held|missing|other`: whether the
  *                                       client (the processId of initialize) holds the file's lock
- *                                       under KIRO_JAVA_FORMAT_CACHE
+ *                                       under KIRO_JAVA_FORMAT_CACHE; `indexed <ms>` when the
+ *                                       indexing of FAKE_INDEXING_MS ends
  */
 
 const fs = require('fs');
@@ -148,6 +149,7 @@ function startIndexing(socket, durationMs) {
   send(socket, { method: '$/progress', params: { token, value: { kind: 'begin', title: 'Indexing' } } });
   setTimeout(() => {
     isIndexing = false;
+    log(`indexed ${Date.now()}`);
     send(socket, { method: '$/progress', params: { token, value: { kind: 'end' } } });
     for (const uri of documents.keys()) publishDiagnostics(socket, uri);
   }, durationMs);
